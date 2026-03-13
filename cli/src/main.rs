@@ -8,7 +8,8 @@ use indicatif::{ProgressBar, ProgressStyle};
 #[derive(Parser, Debug)]
 #[command(name = "safetensors-surgery", version, about)]
 struct Args {
-    /// Path to the base model safetensors file.
+    /// Path to the base model: a .safetensors file, or a directory containing
+    /// model.safetensors or model.safetensors.index.json (sharded).
     #[arg(long)]
     base_model: PathBuf,
 
@@ -16,7 +17,7 @@ struct Args {
     #[arg(long)]
     adapter: PathBuf,
 
-    /// Path for the merged output safetensors file.
+    /// Output path: a .safetensors file for single-file models, or a directory for sharded models.
     #[arg(long)]
     output: PathBuf,
 

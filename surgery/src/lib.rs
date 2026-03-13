@@ -65,6 +65,14 @@ pub struct MergeStats {
 /// Merges a LoRA adapter into a base model, writing the result to the output path.
 ///
 /// Memory usage is bounded by one tensor at a time regardless of model size.
+///
+/// `base_model_path` can be:
+/// - A `.safetensors` file (single-file model)
+/// - A directory containing `model.safetensors` (single-file model)
+/// - A directory containing `model.safetensors.index.json` (sharded model)
+///
+/// For single-file models, `output_path` is the output `.safetensors` file.
+/// For sharded models, `output_path` is the output directory (shards + index.json).
 pub fn merge_adapter(
     base_model_path: &Path,
     adapter_path: &Path,
@@ -76,11 +84,21 @@ pub fn merge_adapter(
 
     let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
 
-    io::merge_and_write(
-        base_model_path,
-        &adapter_weights_path,
-        &adapter_config,
-        output_path,
-        progress,
-    )
+    match io::resolve_base_model(base_model_path)? {
+        io::BaseModelSource::SingleFile(base_file) => io::merge_and_write(
+            &base_file,
+            &adapter_weights_path,
+            &adapter_config,
+            output_path,
+            progress,
+        ),
+        io::BaseModelSource::Sharded { dir, index } => io::merge_sharded(
+            &dir,
+            &index,
+            &adapter_weights_path,
+            &adapter_config,
+            output_path,
+            progress,
+        ),
+    }
 }
