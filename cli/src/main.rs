@@ -1,0 +1,77 @@
+use std::path::PathBuf;
+
+use anyhow::{Context, Result};
+use clap::Parser;
+use indicatif::{ProgressBar, ProgressStyle};
+
+/// Merge a PEFT LoRA adapter into a safetensors base model with bounded memory.
+#[derive(Parser, Debug)]
+#[command(name = "safetensors-surgery", version, about)]
+struct Args {
+    /// Path to the base model safetensors file.
+    #[arg(long)]
+    base_model: PathBuf,
+
+    /// Path to the adapter directory (containing adapter_config.json and adapter_model.safetensors).
+    #[arg(long)]
+    adapter: PathBuf,
+
+    /// Path for the merged output safetensors file.
+    #[arg(long)]
+    output: PathBuf,
+
+    /// Print what would be done without writing output.
+    #[arg(long, default_value_t = false)]
+    dry_run: bool,
+}
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+
+    if args.dry_run {
+        let config_path = args.adapter.join("adapter_config.json");
+        let config = safetensors_surgery::config::AdapterConfig::from_path(&config_path)
+            .context("failed to read adapter config")?;
+        println!("Adapter config:");
+        println!("  rank: {}", config.rank());
+        println!("  alpha: {}", config.alpha());
+        println!("  scaling: {}", config.scaling());
+        println!("  target_modules: {:?}", config.target_modules());
+        println!("  fan_in_fan_out: {}", config.fan_in_fan_out());
+        println!("  bias: {:?}", config.bias());
+        println!("\nDry run complete. No output written.");
+        return Ok(());
+    }
+
+    let pb = ProgressBar::new(0);
+    pb.set_style(
+        ProgressStyle::default_bar()
+            .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} tensors")
+            .unwrap()
+            .progress_chars("##-"),
+    );
+
+    let progress_callback = |current: usize, total: usize| {
+        pb.set_length(total as u64);
+        pb.set_position(current as u64);
+    };
+
+    let stats = safetensors_surgery::merge_adapter(
+        &args.base_model,
+        &args.adapter,
+        &args.output,
+        Some(&progress_callback),
+    )
+    .context("merge failed")?;
+
+    pb.finish_with_message("done");
+
+    println!("\nMerge complete:");
+    println!("  tensors copied:   {}", stats.tensors_copied);
+    println!("  tensors merged:   {}", stats.tensors_merged);
+    println!("  tensors replaced: {}", stats.tensors_replaced);
+    println!("  biases merged:    {}", stats.biases_merged);
+    println!("\nOutput written to: {}", args.output.display());
+
+    Ok(())
+}
