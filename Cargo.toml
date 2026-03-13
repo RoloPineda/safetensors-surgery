@@ -1,0 +1,6 @@
+[workspace]
+members = [
+    "surgery",
+    "cli",
+]
+resolver = "2"
