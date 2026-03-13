@@ -6,11 +6,15 @@ use serde::Deserialize;
 
 use crate::{Result, SurgeryError};
 
+/// Controls how bias tensors are handled during merge.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BiasMode {
+    /// No bias tensors in the adapter.
     None,
+    /// Bias tensors for target modules only.
     LoraOnly,
+    /// Bias tensors for all modules.
     All,
 }
 
@@ -57,27 +61,33 @@ impl AdapterConfig {
         Ok(config)
     }
 
+    /// Returns the LoRA rank.
     pub fn rank(&self) -> u32 {
         self.r
     }
 
+    /// Returns the LoRA alpha value.
     pub fn alpha(&self) -> f32 {
         self.lora_alpha
     }
 
     /// Returns the scaling coefficient `alpha / r`.
+    #[must_use]
     pub fn scaling(&self) -> f32 {
         self.lora_alpha / self.r as f32
     }
 
+    /// Returns the target module names for LoRA application.
     pub fn target_modules(&self) -> &[String] {
         &self.target_modules
     }
 
+    /// Returns whether Conv1D-style transposition is enabled.
     pub fn fan_in_fan_out(&self) -> bool {
         self.fan_in_fan_out
     }
 
+    /// Returns the bias handling mode.
     pub fn bias(&self) -> &BiasMode {
         &self.bias
     }

@@ -71,10 +71,10 @@ pub fn bytes_to_f32(
         }
     };
 
-    Array2::from_shape_vec((rows, cols), values).map_err(|e| SurgeryError::ShapeMismatch {
+    Array2::from_shape_vec((rows, cols), values).map_err(|_| SurgeryError::ShapeMismatch {
         name: name.to_string(),
         expected: vec![rows, cols],
-        got: vec![e.to_string().len()],
+        got: shape.to_vec(),
     })
 }
 
@@ -104,6 +104,7 @@ pub fn f32_to_bytes(array: &Array2<f32>, dtype: Dtype) -> Result<Vec<u8>> {
 /// Computes `W_base + (alpha / r) * (lora_B @ lora_A)`.
 ///
 /// When `fan_in_fan_out` is true, `lora_A` is transposed before the matmul.
+#[must_use]
 pub fn merge_lora(
     base: &Array2<f32>,
     lora_a: &Array2<f32>,
@@ -111,17 +112,17 @@ pub fn merge_lora(
     scaling: f32,
     fan_in_fan_out: bool,
 ) -> Array2<f32> {
-    let a = if fan_in_fan_out {
-        lora_a.t().to_owned()
-    } else {
-        lora_a.clone()
-    };
-
     // [out_features, r] @ [r, in_features] = [out_features, in_features]
-    let delta = lora_b.dot(&a);
+    let delta = if fan_in_fan_out {
+        lora_b.dot(&lora_a.t())
+    } else {
+        lora_b.dot(lora_a)
+    };
     base + &(delta * scaling)
 }
 
+/// Adds adapter bias values to base bias values element-wise.
+#[must_use]
 pub fn merge_bias(base_bias: &Array2<f32>, adapter_bias: &Array2<f32>) -> Array2<f32> {
     base_bias + adapter_bias
 }

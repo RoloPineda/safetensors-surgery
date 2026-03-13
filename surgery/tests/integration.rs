@@ -17,7 +17,10 @@ fn write_f32_safetensors(path: &Path, tensors: &[(&str, &[f32], Vec<usize>)]) {
         .iter()
         .zip(byte_vecs.iter())
         .map(|((name, _, shape), (_, bytes))| {
-            (*name, TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap())
+            (
+                *name,
+                TensorView::new(Dtype::F32, shape.clone(), bytes).unwrap(),
+            )
         })
         .collect();
 

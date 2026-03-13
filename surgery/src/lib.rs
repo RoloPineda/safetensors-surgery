@@ -9,6 +9,7 @@ use std::path::Path;
 
 use thiserror::Error;
 
+/// Errors that can occur during safetensors merge operations.
 #[derive(Debug, Error)]
 pub enum SurgeryError {
     #[error("I/O error: {0}")]
@@ -49,8 +50,10 @@ pub enum SurgeryError {
     ShardingError(String),
 }
 
+/// Result type alias using `SurgeryError`.
 pub type Result<T> = std::result::Result<T, SurgeryError>;
 
+/// Statistics returned after a merge operation completes.
 #[derive(Debug, Clone)]
 pub struct MergeStats {
     pub tensors_copied: usize,

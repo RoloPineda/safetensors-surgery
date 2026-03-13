@@ -4,6 +4,7 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{Result, SurgeryError};
 
+/// Maps base model tensor names to their corresponding adapter tensor names.
 #[derive(Debug)]
 pub struct NameMapping {
     /// base_name -> (lora_A adapter name, lora_B adapter name)
@@ -17,18 +18,23 @@ pub struct NameMapping {
 const ADAPTER_PREFIX: &str = "base_model.model.";
 
 impl NameMapping {
+    /// Returns the (lora_A, lora_B) adapter names for a base tensor, if it is a LoRA target.
     pub fn lora_pair(&self, base_name: &str) -> Option<&(String, String)> {
         self.lora_targets.get(base_name)
     }
 
+    /// Returns true if the base tensor has matching LoRA adapter weights.
+    #[must_use]
     pub fn is_lora_target(&self, base_name: &str) -> bool {
         self.lora_targets.contains_key(base_name)
     }
 
+    /// Returns the adapter tensor name if this base tensor should be fully replaced.
     pub fn replacement(&self, base_name: &str) -> Option<&str> {
         self.replacements.get(base_name).map(|s| s.as_str())
     }
 
+    /// Returns the adapter bias tensor name for a base bias tensor.
     pub fn bias_source(&self, base_name: &str) -> Option<&str> {
         self.biases.get(base_name).map(|s| s.as_str())
     }
@@ -53,34 +59,18 @@ pub fn build_name_mapping(
     for &adapter_name in adapter_tensor_names {
         let stripped = match adapter_name.strip_prefix(ADAPTER_PREFIX) {
             Some(s) => s,
-            None => {
-                eprintln!(
-                    "warning: adapter tensor '{}' does not start with '{}', skipping",
-                    adapter_name, ADAPTER_PREFIX
-                );
-                continue;
-            }
+            None => continue,
         };
 
         if let Some(base_part) = stripped.strip_suffix(".lora_A.weight") {
             let base_weight = format!("{base_part}.weight");
             if base_set.contains(base_weight.as_str()) {
                 lora_a_map.insert(base_weight, adapter_name.to_string());
-            } else {
-                eprintln!(
-                    "warning: adapter tensor '{}' has no matching base tensor '{}'",
-                    adapter_name, base_weight
-                );
             }
         } else if let Some(base_part) = stripped.strip_suffix(".lora_B.weight") {
             let base_weight = format!("{base_part}.weight");
             if base_set.contains(base_weight.as_str()) {
                 lora_b_map.insert(base_weight, adapter_name.to_string());
-            } else {
-                eprintln!(
-                    "warning: adapter tensor '{}' has no matching base tensor '{}'",
-                    adapter_name, base_weight
-                );
             }
         } else if let Some(save_modules) = modules_to_save {
             for module in save_modules {
@@ -99,11 +89,6 @@ pub fn build_name_mapping(
     for (base_name, a_name) in &lora_a_map {
         if let Some(b_name) = lora_b_map.get(base_name) {
             lora_targets.insert(base_name.clone(), (a_name.clone(), b_name.clone()));
-        } else {
-            eprintln!(
-                "warning: found lora_A for '{}' but no matching lora_B",
-                base_name
-            );
         }
     }
 

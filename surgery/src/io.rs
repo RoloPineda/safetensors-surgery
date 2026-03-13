@@ -53,7 +53,7 @@ impl MappedSafetensors {
         for (name, info) in metadata.tensors() {
             let (start, end) = info.data_offsets;
             tensors.push((
-                name.to_string(),
+                name,
                 TensorInfo {
                     dtype: info.dtype,
                     shape: info.shape.clone(),
