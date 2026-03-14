@@ -173,4 +173,51 @@ mod tests {
         let config = AdapterConfig::from_json(json).unwrap();
         assert_eq!(config.modules_to_save().unwrap(), &["lm_head"]);
     }
+
+    #[test]
+    fn parse_config_with_all_bias() {
+        let json = r#"{
+            "r": 8,
+            "lora_alpha": 16,
+            "target_modules": ["q_proj"],
+            "bias": "all",
+            "peft_type": "LORA"
+        }"#;
+        let config = AdapterConfig::from_json(json).unwrap();
+        assert_eq!(config.bias(), &BiasMode::All);
+    }
+
+    #[test]
+    fn parse_config_defaults() {
+        // Minimal config — only required fields
+        let json = r#"{
+            "r": 4,
+            "lora_alpha": 8,
+            "target_modules": ["q_proj"],
+            "peft_type": "LORA"
+        }"#;
+        let config = AdapterConfig::from_json(json).unwrap();
+        assert!(!config.fan_in_fan_out());
+        assert_eq!(config.bias(), &BiasMode::None);
+        assert!(config.modules_to_save().is_none());
+        assert_eq!(config.scaling(), 2.0);
+    }
+
+    #[test]
+    fn parse_config_from_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_path = dir.path().join("adapter_config.json");
+        std::fs::write(
+            &config_path,
+            r#"{
+            "r": 8,
+            "lora_alpha": 16,
+            "target_modules": ["q_proj"],
+            "peft_type": "LORA"
+        }"#,
+        )
+        .unwrap();
+        let config = AdapterConfig::from_path(&config_path).unwrap();
+        assert_eq!(config.rank(), 8);
+    }
 }
