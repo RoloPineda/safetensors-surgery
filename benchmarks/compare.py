@@ -133,6 +133,22 @@ def parse_gnu_time_stderr(stderr):
     return peak_rss_mb, wall_seconds
 
 
+def drop_caches():
+    """Drops the OS page cache, dentries, and inodes.
+
+    Requires root. Ensures each run starts with a cold disk cache
+    for fair wall-clock comparison across tools.
+    """
+    try:
+        subprocess.run(
+            ["sudo", "-n", "sh", "-c", "echo 3 > /proc/sys/vm/drop_caches"],
+            check=True,
+            capture_output=True,
+        )
+    except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        print(f"  Warning: could not drop caches: {e}", file=sys.stderr)
+
+
 def measure_surgery(base_path, adapter_path, output_path):
     """Runs the Rust CLI under /usr/bin/time and returns (peak_rss_mb, wall_seconds).
 
@@ -184,7 +200,7 @@ def measure_peft_subprocess(base_dir, adapter_path, output_path, low_memory=Fals
 
         low_memory = {low_mem_flag} == "1"
 
-        load_kwargs = {{"torch_dtype": torch.float16}}
+        load_kwargs = {{"torch_dtype": "auto"}}
         if low_memory:
             load_kwargs["low_cpu_mem_usage"] = True
 
@@ -224,7 +240,6 @@ def write_mergekit_config(base_dir, adapter_path, output_yaml_path):
             parameters:
               weight: 1.0
         merge_method: passthrough
-        dtype: float16
     """)
     with open(output_yaml_path, "w") as f:
         f.write(config)
@@ -449,41 +464,58 @@ def compute_f64_reference(base_dir, adapter_dir):
 
 
 def measure_accuracy(tool_path, lora_reference, base_tensors, lora_target_names):
-    """Measures a tool's output accuracy against the f64 gold standard.
+    """Measures a tool's output equivalence against the f64 gold standard.
 
-    For LoRA target tensors, computes max absolute error and RMS error
-    against the f64 reference (downcast to the base model's dtype).
-    For non-LoRA tensors, counts how many are bit-identical to the
-    original base model.
+    For LoRA target tensors, checks if the tool's output is byte-identical
+    to the reference when both are in the output dtype. Also reports the
+    intermediate f64 error and the output dtype's epsilon for context.
+
+    For non-LoRA tensors, counts how many are bit-identical to the original
+    base model.
 
     Args:
         tool_path: Path to the tool's output directory or file.
-        lora_reference: Dict of gold standard tensors for LoRA targets.
+        lora_reference: Dict of gold standard tensors for LoRA targets
+            (already downcast to base dtype).
         base_tensors: Dict of original base model tensors.
         lora_target_names: Set of tensor names that are LoRA targets.
 
     Returns:
-        Dict with accuracy metrics: lora_max_error, lora_mean_rms,
+        Dict with accuracy metrics: lora_max_error, lora_equivalent,
+        lora_equivalent_total, output_dtype, output_epsilon,
         non_lora_identical, non_lora_total.
     """
     import torch
 
+    dtype_epsilon = {
+        torch.float16: 9.77e-4,
+        torch.bfloat16: 7.81e-3,
+        torch.float32: 1.19e-7,
+    }
+
     tool_tensors = load_tensors_from_path(tool_path)
 
     lora_max_errors = []
-    lora_rms_errors = []
+    lora_equivalent_count = 0
+    lora_equivalent_total = 0
+    output_dtype = None
 
     for name in sorted(lora_target_names):
         if name not in tool_tensors or name not in lora_reference:
             continue
 
-        tool_t = tool_tensors[name].float()
-        ref_t = lora_reference[name].float()
+        ref_t = lora_reference[name]
+        tool_t = tool_tensors[name]
 
-        diff = (tool_t - ref_t).abs()
+        if output_dtype is None:
+            output_dtype = ref_t.dtype
+
+        lora_equivalent_total += 1
+        if torch.equal(tool_t, ref_t):
+            lora_equivalent_count += 1
+
+        diff = (tool_t.float() - ref_t.float()).abs()
         lora_max_errors.append(diff.max().item())
-        rms = torch.sqrt((diff**2).mean()).item()
-        lora_rms_errors.append(rms)
 
     non_lora_total = 0
     non_lora_identical = 0
@@ -499,13 +531,15 @@ def measure_accuracy(tool_path, lora_reference, base_tensors, lora_target_names)
             non_lora_identical += 1
 
     max_err = max(lora_max_errors) if lora_max_errors else 0.0
-    mean_rms = (
-        sum(lora_rms_errors) / len(lora_rms_errors) if lora_rms_errors else 0.0
-    )
+    epsilon = dtype_epsilon.get(output_dtype, 0.0)
 
     return {
         "lora_max_error": max_err,
-        "lora_mean_rms": mean_rms,
+        "lora_equivalent": lora_equivalent_count,
+        "lora_equivalent_total": lora_equivalent_total,
+        "output_dtype": str(output_dtype),
+        "output_epsilon": epsilon,
+        "below_epsilon": max_err <= epsilon,
         "non_lora_identical": non_lora_identical,
         "non_lora_total": non_lora_total,
     }
@@ -552,7 +586,8 @@ def run_single_measurement(tool, base_dir, base_file, adapter_dir, tmp_root):
     raise ValueError(f"Unknown tool: {tool}")
 
 
-def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3):
+def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3,
+                  drop_caches_enabled=False):
     """Runs all selected tools on a single model, with repeated measurements.
 
     First-run outputs are saved to a persistent temp directory so that
@@ -564,6 +599,7 @@ def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3):
         adapter_dir: Path to the adapter directory.
         tools: List of tool names to benchmark.
         num_runs: Number of runs per tool (median is reported).
+        drop_caches_enabled: If True, drop OS page cache before each run.
 
     Returns:
         Dict with label and per-tool median results.
@@ -593,6 +629,8 @@ def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3):
             time_values = []
 
             for run_idx in range(num_runs):
+                if drop_caches_enabled:
+                    drop_caches()
                 if run_idx == 0:
                     tool_out = os.path.join(verify_dir, tool)
                     os.makedirs(tool_out, exist_ok=True)
@@ -675,11 +713,21 @@ def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3):
                         if acc["non_lora_total"] > 0
                         else 0.0
                     )
+                    eq_pct = (
+                        100.0 * acc["lora_equivalent"] / acc["lora_equivalent_total"]
+                        if acc["lora_equivalent_total"] > 0
+                        else 0.0
+                    )
+                    status = "EQUIVALENT" if acc["below_epsilon"] else "DIVERGENT"
                     print(
                         f"    {label}:"
-                        f"  LoRA max_err={acc['lora_max_error']:.6e}"
-                        f"  LoRA mean_rms={acc['lora_mean_rms']:.6e}"
-                        f"  non-LoRA bit-identical="
+                        f"  max_intermediate_err={acc['lora_max_error']:.2e}"
+                        f"  dtype_epsilon={acc['output_epsilon']:.2e}"
+                        f"  status={status}"
+                        f"  lora_bytewise={acc['lora_equivalent']}"
+                        f"/{acc['lora_equivalent_total']}"
+                        f" ({eq_pct:.0f}%)"
+                        f"  passthrough="
                         f"{acc['non_lora_identical']}/{acc['non_lora_total']}"
                         f" ({pct:.0f}%)"
                     )
@@ -716,7 +764,7 @@ def print_summary(results, tools):
     print(
         f"{'Model':<22} {'Tool':<23} "
         f"{'RSS (MB)':>10} {'Time (s)':>10} "
-        f"{'LoRA max_err':>14} {'LoRA RMS':>12} "
+        f"{'Max Err':>12} {'Status':>14} "
         f"{'Passthrough':>13}"
     )
     print("-" * width)
@@ -741,18 +789,18 @@ def print_summary(results, tools):
                     else 0.0
                 )
                 acc_max = f"{acc['lora_max_error']:.2e}"
-                acc_rms = f"{acc['lora_mean_rms']:.2e}"
+                status = "Equivalent" if acc["below_epsilon"] else "Divergent"
                 passthrough = f"{pct:.0f}%"
             else:
                 acc_max = "n/a"
-                acc_rms = "n/a"
+                status = "n/a"
                 passthrough = "n/a"
 
             print(
                 f"{label_col:<22} {tool_name:<23} "
                 f"{stats['peak_rss_mb']:>10.0f} "
                 f"{stats['wall_seconds']:>10.2f} "
-                f"{acc_max:>14} {acc_rms:>12} "
+                f"{acc_max:>12} {status:>14} "
                 f"{passthrough:>13}"
             )
             first_tool = False
@@ -806,13 +854,6 @@ def save_chart(results, tools, output_path):
 
     labels = [r["label"] for r in results]
     base_path = output_path.replace(".png", "")
-
-    has_accuracy = any(
-        r.get(t, {}).get("accuracy") is not None
-        for r in results
-        for t in tools
-        if isinstance(r.get(t), dict)
-    )
 
     def make_chart(title, subtitle, y_values_per_tool, text_fmt, y_title,
                    filename, show_legend=True, log_y=False):
@@ -921,22 +962,16 @@ def save_chart(results, tools, output_path):
 
     memory_vals = {}
     time_vals = {}
-    accuracy_vals = {}
 
     for tool in tools:
         mem = []
         time_ = []
-        acc = []
         for r in results:
             stats = r.get(tool)
             mem.append(stats["peak_rss_mb"] if stats else 0)
             time_.append(stats["wall_seconds"] if stats else 0)
-            acc_data = stats.get("accuracy") if isinstance(stats, dict) else None
-            acc_val = acc_data["lora_mean_rms"] if acc_data else 0
-            acc.append(acc_val)
         memory_vals[tool] = mem
         time_vals[tool] = time_
-        accuracy_vals[tool] = acc
 
     def fmt_memory(v):
         """Formats memory values with MB suffix."""
@@ -947,18 +982,6 @@ def save_chart(results, tools, output_path):
     def fmt_time(v):
         """Formats time values with unit."""
         return f"{v:.1f}s"
-
-    def fmt_accuracy(v):
-        """Formats accuracy values in human-readable form."""
-        if v == 0:
-            return "exact"
-        if v < 1e-9:
-            return f"{v:.1e}"
-        if v < 1e-6:
-            return f"{v * 1e9:.1f} ppb"
-        if v < 1e-3:
-            return f"{v * 1e6:.1f} ppm"
-        return f"{v:.4f}"
 
     make_chart(
         title="Peak Memory Usage",
@@ -980,21 +1003,6 @@ def save_chart(results, tools, output_path):
         show_legend=True,
     )
 
-    if has_accuracy:
-        make_chart(
-            title="LoRA Merge Accuracy",
-            subtitle=(
-                "Mean RMS error vs f64 gold standard (merge computed in f64, "
-                "downcast once to output dtype). Lower is better."
-            ),
-            y_values_per_tool=accuracy_vals,
-            text_fmt=fmt_accuracy,
-            y_title="Mean RMS Error",
-            filename=f"{base_path}_accuracy",
-            show_legend=True,
-            log_y=True,
-        )
-
     results_json = f"{base_path}.json"
     export = []
     for r in results:
@@ -1010,7 +1018,10 @@ def save_chart(results, tools, output_path):
                 acc = stats.get("accuracy")
                 if acc:
                     entry[f"{prefix}_lora_max_error"] = acc["lora_max_error"]
-                    entry[f"{prefix}_lora_mean_rms"] = acc["lora_mean_rms"]
+                    entry[f"{prefix}_lora_equivalent"] = acc["lora_equivalent"]
+                    entry[f"{prefix}_lora_equivalent_total"] = acc["lora_equivalent_total"]
+                    entry[f"{prefix}_below_epsilon"] = acc["below_epsilon"]
+                    entry[f"{prefix}_output_dtype"] = acc["output_dtype"]
                     entry[f"{prefix}_non_lora_identical"] = acc["non_lora_identical"]
                     entry[f"{prefix}_non_lora_total"] = acc["non_lora_total"]
             else:
@@ -1097,10 +1108,31 @@ def main():
         default="benchmarks/results.png",
         help="Path for the output chart",
     )
+    parser.add_argument(
+        "--drop-caches",
+        action="store_true",
+        help="Run 'sudo echo 3 > /proc/sys/vm/drop_caches' before each run (requires passwordless sudo)",
+    )
     args = parser.parse_args()
 
     print("Building release binary...")
     subprocess.run(["cargo", "build", "--release"], check=True)
+
+    if args.drop_caches:
+        try:
+            subprocess.run(
+                ["sudo", "-n", "true"],
+                check=True,
+                capture_output=True,
+            )
+            print("Drop caches enabled (sudo verified)")
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            print(
+                "Error: --drop-caches requires passwordless sudo.\n"
+                "Run: echo \"$USER ALL=(ALL) NOPASSWD: ALL\" | sudo tee /etc/sudoers.d/$USER",
+                file=sys.stderr,
+            )
+            sys.exit(1)
 
     if args.tools:
         tools = args.tools
@@ -1119,7 +1151,8 @@ def main():
 
     if args.base and args.adapter:
         result = run_benchmark(
-            "Custom", args.base, args.adapter, tools, num_runs=args.runs
+            "Custom", args.base, args.adapter, tools,
+            num_runs=args.runs, drop_caches_enabled=args.drop_caches,
         )
         results.append(result)
     else:
@@ -1128,7 +1161,8 @@ def main():
             base_dir = preset["base"]
             adapter_dir = preset["adapter"]
             result = run_benchmark(
-                preset["label"], base_dir, adapter_dir, tools, num_runs=args.runs
+                preset["label"], base_dir, adapter_dir, tools,
+                num_runs=args.runs, drop_caches_enabled=args.drop_caches,
             )
             results.append(result)
 
