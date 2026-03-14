@@ -22,11 +22,7 @@ pub enum SurgeryError {
     Safetensors(String),
 
     #[error("tensor '{name}' not found in {location}")]
-    TensorNotFound {
-        name: String,
-        /// E.g. "base model", "adapter".
-        location: String,
-    },
+    TensorNotFound { name: String, location: String },
 
     #[error("shape mismatch for tensor '{name}': expected {expected:?}, got {got:?}")]
     ShapeMismatch {
@@ -50,7 +46,6 @@ pub enum SurgeryError {
     ShardingError(String),
 }
 
-/// Result type alias using `SurgeryError`.
 pub type Result<T> = std::result::Result<T, SurgeryError>;
 
 /// Statistics returned after a merge operation completes.
@@ -62,9 +57,39 @@ pub struct MergeStats {
     pub biases_merged: usize,
 }
 
+/// Pre-merge analysis returned by [`dry_run_info`].
+#[derive(Debug, Clone)]
+pub struct DryRunInfo {
+    pub base_tensor_count: usize,
+    pub lora_target_count: usize,
+    pub replacement_count: usize,
+    pub bias_merge_count: usize,
+    pub passthrough_count: usize,
+    pub estimated_output_bytes: u64,
+    pub is_sharded: bool,
+    pub shard_count: usize,
+}
+
+/// Inspects a base model and adapter without writing output.
+pub fn dry_run_info(base_model_path: &Path, adapter_path: &Path) -> Result<DryRunInfo> {
+    let adapter_config_path = adapter_path.join("adapter_config.json");
+    let adapter_config = config::AdapterConfig::from_path(&adapter_config_path)?;
+    let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
+
+    io::compute_dry_run_info(base_model_path, &adapter_weights_path, &adapter_config)
+}
+
 /// Merges a LoRA adapter into a base model, writing the result to the output path.
 ///
 /// Memory usage is bounded by one tensor at a time regardless of model size.
+///
+/// `base_model_path` can be:
+/// - A `.safetensors` file (single-file model)
+/// - A directory containing `model.safetensors` (single-file model)
+/// - A directory containing `model.safetensors.index.json` (sharded model)
+///
+/// For single-file models, `output_path` is the output `.safetensors` file.
+/// For sharded models, `output_path` is the output directory (shards + index.json).
 pub fn merge_adapter(
     base_model_path: &Path,
     adapter_path: &Path,
@@ -76,11 +101,21 @@ pub fn merge_adapter(
 
     let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
 
-    io::merge_and_write(
-        base_model_path,
-        &adapter_weights_path,
-        &adapter_config,
-        output_path,
-        progress,
-    )
+    match io::resolve_base_model(base_model_path)? {
+        io::BaseModelSource::SingleFile(base_file) => io::merge_and_write(
+            &base_file,
+            &adapter_weights_path,
+            &adapter_config,
+            output_path,
+            progress,
+        ),
+        io::BaseModelSource::Sharded { dir, index } => io::merge_sharded(
+            &dir,
+            &index,
+            &adapter_weights_path,
+            &adapter_config,
+            output_path,
+            progress,
+        ),
+    }
 }

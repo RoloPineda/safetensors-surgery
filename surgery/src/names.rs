@@ -17,6 +17,11 @@ pub struct NameMapping {
 
 const ADAPTER_PREFIX: &str = "base_model.model.";
 
+/// Checks if `name` contains `segment` as an exact dot-delimited path segment.
+fn has_path_segment(name: &str, segment: &str) -> bool {
+    name.split('.').any(|part| part == segment)
+}
+
 impl NameMapping {
     /// Returns the (lora_A, lora_B) adapter names for a base tensor, if it is a LoRA target.
     pub fn lora_pair(&self, base_name: &str) -> Option<&(String, String)> {
@@ -74,7 +79,7 @@ pub fn build_name_mapping(
             }
         } else if let Some(save_modules) = modules_to_save {
             for module in save_modules {
-                if stripped.contains(module.as_str()) && base_set.contains(stripped) {
+                if has_path_segment(stripped, module) && base_set.contains(stripped) {
                     replacements.insert(stripped.to_string(), adapter_name.to_string());
                 }
             }
@@ -92,15 +97,18 @@ pub fn build_name_mapping(
         }
     }
 
-    for module in target_modules {
-        let has_match = lora_targets
+    // Only error if NO target modules have matching adapter tensors.
+    // Individual modules without matches are silently skipped — this supports
+    // adapters trained on a subset of layers.
+    let matched_any = target_modules.iter().any(|module| {
+        lora_targets
             .keys()
-            .any(|base_name| base_name.contains(module.as_str()));
-        if !has_match {
-            return Err(SurgeryError::MissingAdapterTensor {
-                module: module.clone(),
-            });
-        }
+            .any(|base_name| base_name.contains(module.as_str()))
+    });
+    if !target_modules.is_empty() && !matched_any {
+        return Err(SurgeryError::MissingAdapterTensor {
+            module: target_modules.join(", "),
+        });
     }
 
     Ok(NameMapping {
@@ -152,7 +160,7 @@ mod tests {
     }
 
     #[test]
-    fn missing_target_module_errors() {
+    fn missing_some_target_modules_still_succeeds() {
         let base_names = vec!["model.layers.0.self_attn.q_proj.weight"];
         let adapter_names = vec![
             "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
@@ -160,9 +168,24 @@ mod tests {
         ];
         let target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
 
+        // Should succeed — q_proj matches, v_proj is silently skipped.
+        let mapping =
+            build_name_mapping(&base_names, &adapter_names, &target_modules, None).unwrap();
+        assert!(mapping.is_lora_target("model.layers.0.self_attn.q_proj.weight"));
+    }
+
+    #[test]
+    fn no_target_modules_match_errors() {
+        let base_names = vec!["model.layers.0.self_attn.k_proj.weight"];
+        let adapter_names = vec![
+            "base_model.model.model.layers.0.self_attn.k_proj.lora_A.weight",
+            // Missing lora_B — no complete pair
+        ];
+        let target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
+
         let err =
             build_name_mapping(&base_names, &adapter_names, &target_modules, None).unwrap_err();
-        assert!(err.to_string().contains("v_proj"));
+        assert!(err.to_string().contains("q_proj, v_proj"));
     }
 
     #[test]
@@ -188,5 +211,37 @@ mod tests {
             mapping.replacement("lm_head.weight"),
             Some("base_model.model.lm_head.weight")
         );
+    }
+
+    #[test]
+    fn modules_to_save_exact_segment_match() {
+        let base_names = vec![
+            "model.layers.0.self_attn.q_proj.weight",
+            "lm_head.weight",
+            "old_lm_head.weight",
+        ];
+        let adapter_names = vec![
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+            "base_model.model.lm_head.weight",
+            "base_model.model.old_lm_head.weight",
+        ];
+        let target_modules = vec!["q_proj".to_string()];
+        let modules_to_save = vec!["lm_head".to_string()];
+
+        let mapping = build_name_mapping(
+            &base_names,
+            &adapter_names,
+            &target_modules,
+            Some(&modules_to_save),
+        )
+        .unwrap();
+
+        assert_eq!(
+            mapping.replacement("lm_head.weight"),
+            Some("base_model.model.lm_head.weight")
+        );
+        // "old_lm_head" should NOT match "lm_head" — exact segment match required.
+        assert_eq!(mapping.replacement("old_lm_head.weight"), None);
     }
 }
