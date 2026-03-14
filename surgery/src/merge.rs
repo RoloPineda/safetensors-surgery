@@ -241,4 +241,46 @@ mod tests {
         let err = bytes_to_f32(&bytes, Dtype::I32, &[2, 2], "test_tensor").unwrap_err();
         assert!(err.to_string().contains("unsupported dtype"));
     }
+
+    #[test]
+    fn bytes_to_f32_wrong_length_errors() {
+        // Shape says 2x2 (4 elements = 16 bytes for F32), but only give 8 bytes
+        let bytes = vec![0u8; 8];
+        let err = bytes_to_f32(&bytes, Dtype::F32, &[2, 2], "test_tensor").unwrap_err();
+        assert!(err.to_string().contains("shape mismatch"));
+    }
+
+    #[test]
+    fn bytes_to_f32_1d_shape_errors() {
+        let bytes = vec![0u8; 8];
+        let err = bytes_to_f32(&bytes, Dtype::F32, &[2], "test_tensor").unwrap_err();
+        assert!(err.to_string().contains("shape mismatch"));
+    }
+
+    #[test]
+    fn merge_lora_scaling_factor() {
+        // Verify scaling = alpha/r is correctly applied
+        let base = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 0.0, 0.0]).unwrap();
+        let lora_a = Array2::from_shape_vec((1, 2), vec![1.0, 1.0]).unwrap();
+        let lora_b = Array2::from_shape_vec((2, 1), vec![1.0, 1.0]).unwrap();
+        // scaling = alpha/r = 16/8 = 2.0
+        let merged = merge_lora(&base, &lora_a, &lora_b, 2.0, false);
+        // delta = [[1,1],[1,1]], merged = 0 + 2.0 * delta = [[2,2],[2,2]]
+        assert_eq!(merged[[0, 0]], 2.0);
+        assert_eq!(merged[[1, 1]], 2.0);
+    }
+
+    #[test]
+    fn f64_to_bytes_bf16_roundtrip() {
+        let array = Array2::from_shape_vec((1, 4), vec![1.0_f64, 2.0, -3.0, 0.5]).unwrap();
+        let bytes = f64_to_bytes(&array, Dtype::BF16).unwrap();
+        // Should produce 8 bytes (4 elements * 2 bytes each)
+        assert_eq!(bytes.len(), 8);
+        // Read back via bytes_to_f32
+        let recovered = bytes_to_f32(&bytes, Dtype::BF16, &[1, 4], "test").unwrap();
+        assert!((recovered[[0, 0]] - 1.0).abs() < 0.05);
+        assert!((recovered[[0, 1]] - 2.0).abs() < 0.05);
+        assert!((recovered[[0, 2]] - (-3.0)).abs() < 0.05);
+        assert!((recovered[[0, 3]] - 0.5).abs() < 0.05);
+    }
 }

@@ -244,4 +244,48 @@ mod tests {
         // "old_lm_head" should NOT match "lm_head" — exact segment match required.
         assert_eq!(mapping.replacement("old_lm_head.weight"), None);
     }
+
+    #[test]
+    fn bias_name_mapping() {
+        let base_names = vec![
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.q_proj.bias",
+        ];
+        let adapter_names = vec![
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+            "base_model.model.model.layers.0.self_attn.q_proj.bias",
+        ];
+        let target_modules = vec!["q_proj".to_string()];
+
+        let mapping =
+            build_name_mapping(&base_names, &adapter_names, &target_modules, None).unwrap();
+
+        assert_eq!(
+            mapping.bias_source("model.layers.0.self_attn.q_proj.bias"),
+            Some("base_model.model.model.layers.0.self_attn.q_proj.bias")
+        );
+    }
+
+    #[test]
+    fn unpaired_lora_a_without_b() {
+        let base_names = vec![
+            "model.layers.0.self_attn.q_proj.weight",
+            "model.layers.0.self_attn.v_proj.weight",
+        ];
+        let adapter_names = vec![
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+            "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+            // v_proj has only lora_A, no lora_B — should not be a target
+            "base_model.model.model.layers.0.self_attn.v_proj.lora_A.weight",
+        ];
+        let target_modules = vec!["q_proj".to_string(), "v_proj".to_string()];
+
+        let mapping =
+            build_name_mapping(&base_names, &adapter_names, &target_modules, None).unwrap();
+
+        assert!(mapping.is_lora_target("model.layers.0.self_attn.q_proj.weight"));
+        // v_proj should NOT be a target since it only has lora_A
+        assert!(!mapping.is_lora_target("model.layers.0.self_attn.v_proj.weight"));
+    }
 }

@@ -128,6 +128,7 @@ impl ShardIndex {
 }
 
 /// Resolved base model source — either a single file or a sharded set.
+#[derive(Debug)]
 pub(crate) enum BaseModelSource {
     SingleFile(PathBuf),
     Sharded { dir: PathBuf, index: ShardIndex },
@@ -870,5 +871,90 @@ mod tests {
     fn resolve_empty_directory_errors() {
         let dir = tempfile::tempdir().unwrap();
         assert!(resolve_base_model(dir.path()).is_err());
+    }
+
+    #[test]
+    fn resolve_base_model_missing_file_errors() {
+        let result = resolve_base_model(Path::new("/nonexistent/path/to/model.safetensors"));
+        assert!(result.is_err());
+        let err = match result {
+            Err(e) => e,
+            Ok(_) => panic!("expected error for nonexistent path"),
+        };
+        assert!(err.to_string().contains("does not exist"));
+    }
+
+    #[test]
+    fn dtype_byte_size_all_supported() {
+        assert_eq!(dtype_byte_size(Dtype::F16).unwrap(), 2);
+        assert_eq!(dtype_byte_size(Dtype::BF16).unwrap(), 2);
+        assert_eq!(dtype_byte_size(Dtype::F32).unwrap(), 4);
+        assert!(dtype_byte_size(Dtype::I32).is_err());
+    }
+
+    #[test]
+    fn metadata_preserved_in_output() {
+        use safetensors::tensor::TensorView;
+
+        let dir = tempfile::tempdir().unwrap();
+
+        // Create base with metadata
+        let base_path = dir.path().join("base.safetensors");
+        let data: Vec<u8> = [1.0_f32, 0.0, 0.0, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let views = vec![(
+            "model.layers.0.self_attn.q_proj.weight",
+            TensorView::new(Dtype::F32, vec![2, 2], &data).unwrap(),
+        )];
+        let mut metadata = HashMap::new();
+        metadata.insert("format".to_string(), "pt".to_string());
+        let serialized = safetensors::tensor::serialize(views, &Some(metadata)).unwrap();
+        fs::write(&base_path, serialized).unwrap();
+
+        // Create adapter
+        let adapter_path = dir.path().join("adapter_model.safetensors");
+        let a_data: Vec<u8> = [1.0_f32, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let b_data: Vec<u8> = [1.0_f32, 1.0]
+            .iter()
+            .flat_map(|v| v.to_le_bytes())
+            .collect();
+        let adapter_views = vec![
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
+                TensorView::new(Dtype::F32, vec![1, 2], &a_data).unwrap(),
+            ),
+            (
+                "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
+                TensorView::new(Dtype::F32, vec![2, 1], &b_data).unwrap(),
+            ),
+        ];
+        let adapter_serialized = safetensors::tensor::serialize(adapter_views, &None).unwrap();
+        fs::write(&adapter_path, adapter_serialized).unwrap();
+
+        let config_json = r#"{
+            "r": 1,
+            "lora_alpha": 1,
+            "target_modules": ["q_proj"],
+            "fan_in_fan_out": false,
+            "bias": "none",
+            "peft_type": "LORA"
+        }"#;
+        let config = crate::config::AdapterConfig::from_json(config_json).unwrap();
+
+        let output_path = dir.path().join("merged.safetensors");
+        merge_and_write(&base_path, &adapter_path, &config, &output_path, None).unwrap();
+
+        // Check metadata is preserved
+        let output = MappedSafetensors::open(&output_path).unwrap();
+        let meta = output
+            .metadata
+            .as_ref()
+            .expect("metadata should be preserved");
+        assert_eq!(meta.get("format"), Some(&"pt".to_string()));
     }
 }
