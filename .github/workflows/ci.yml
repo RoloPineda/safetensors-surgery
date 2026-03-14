@@ -64,6 +64,7 @@ jobs:
   wheels:
     name: Python wheels
     runs-on: ubuntu-latest
+    if: hashFiles('bindings/Cargo.toml') != ''
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
@@ -75,7 +76,7 @@ jobs:
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install maturin
-      - run: maturin build --release --interpreter python${{ matrix.python-version }}
+      - run: maturin build --release --manifest-path bindings/Cargo.toml --interpreter python${{ matrix.python-version }}
       - uses: actions/upload-artifact@v4
         with:
           name: wheel-linux-py${{ matrix.python-version }}

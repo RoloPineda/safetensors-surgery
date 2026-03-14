@@ -1,6 +1,6 @@
 # safetensors-surgery
 
-[![CI](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml/badge.svg)](https://github.com/yourusername/safetensors-surgery/actions/workflows/ci.yml)
+[![CI](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml/badge.svg)](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
 `safetensors-surgery` merges PEFT LoRA adapters into safetensors base models using memory-mapped I/O. It processes tensors one at a time, so a 14B model merges in under 20 seconds using 4GB of RAM. The standard Python workflow needs 57GB for the same operation.
@@ -34,7 +34,7 @@ Merging a LoRA adapter into a base model with PEFT's `merge_and_unload` requires
 ### CLI (from source)
 
 ```sh
-git clone https://github.com/yourusername/safetensors-surgery.git
+git clone https://github.com/RoloPineda/safetensors-surgery.git
 cd safetensors-surgery
 cargo install --path cli
 ```
