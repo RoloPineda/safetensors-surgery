@@ -11,7 +11,7 @@ use safetensors::Dtype;
 use serde::Deserialize;
 
 use crate::config::{AdapterConfig, BiasMode};
-use crate::merge::{bytes_to_f32, f32_to_bytes, merge_bias, merge_lora};
+use crate::merge::{bytes_to_f32, f32_to_bytes, f64_to_bytes, merge_bias, merge_lora};
 use crate::names::build_name_mapping;
 use crate::{MergeStats, Result, SurgeryError};
 
@@ -356,7 +356,7 @@ fn process_tensor(
             config.fan_in_fan_out(),
         );
 
-        let merged_bytes = f32_to_bytes(&merged, info.dtype)?;
+        let merged_bytes = f64_to_bytes(&merged, info.dtype)?;
         writer.write_all(&merged_bytes)?;
         return Ok(TensorAction::Merged);
     }

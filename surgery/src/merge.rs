@@ -111,13 +111,44 @@ pub fn merge_lora(
     lora_b: &Array2<f32>,
     scaling: f32,
     fan_in_fan_out: bool,
-) -> Array2<f32> {
+) -> Array2<f64> {
+    let base_f64 = base.mapv(|v| v as f64);
+    let a_f64 = lora_a.mapv(|v| v as f64);
+    let b_f64 = lora_b.mapv(|v| v as f64);
+
     let delta = if fan_in_fan_out {
-        lora_b.dot(&lora_a.t())
+        b_f64.dot(&a_f64.t())
     } else {
-        lora_b.dot(lora_a)
+        b_f64.dot(&a_f64)
     };
-    base + &(delta * scaling)
+
+    base_f64 + &(delta * scaling as f64)
+}
+
+/// Converts an `Array2<f64>` to raw bytes, downcasting to the storage dtype.
+pub fn f64_to_bytes(array: &Array2<f64>, dtype: Dtype) -> Result<Vec<u8>> {
+    let values = array.as_slice().ok_or_else(|| {
+        SurgeryError::Safetensors("array is not contiguous in memory".to_string())
+    })?;
+
+    match dtype {
+        Dtype::F16 => Ok(values
+            .iter()
+            .flat_map(|&v| f16::from_f64(v).to_le_bytes())
+            .collect()),
+        Dtype::BF16 => Ok(values
+            .iter()
+            .flat_map(|&v| bf16::from_f64(v).to_le_bytes())
+            .collect()),
+        Dtype::F32 => Ok(values
+            .iter()
+            .flat_map(|&v| (v as f32).to_le_bytes())
+            .collect()),
+        _ => Err(SurgeryError::UnsupportedDtype {
+            name: "output".to_string(),
+            dtype: format!("{dtype:?}"),
+        }),
+    }
 }
 
 /// Adds adapter bias values to base bias values element-wise.
