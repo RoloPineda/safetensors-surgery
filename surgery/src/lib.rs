@@ -22,11 +22,7 @@ pub enum SurgeryError {
     Safetensors(String),
 
     #[error("tensor '{name}' not found in {location}")]
-    TensorNotFound {
-        name: String,
-        /// E.g. "base model", "adapter".
-        location: String,
-    },
+    TensorNotFound { name: String, location: String },
 
     #[error("shape mismatch for tensor '{name}': expected {expected:?}, got {got:?}")]
     ShapeMismatch {
@@ -50,7 +46,6 @@ pub enum SurgeryError {
     ShardingError(String),
 }
 
-/// Result type alias using `SurgeryError`.
 pub type Result<T> = std::result::Result<T, SurgeryError>;
 
 /// Statistics returned after a merge operation completes.
@@ -60,6 +55,28 @@ pub struct MergeStats {
     pub tensors_merged: usize,
     pub tensors_replaced: usize,
     pub biases_merged: usize,
+}
+
+/// Pre-merge analysis returned by [`dry_run_info`].
+#[derive(Debug, Clone)]
+pub struct DryRunInfo {
+    pub base_tensor_count: usize,
+    pub lora_target_count: usize,
+    pub replacement_count: usize,
+    pub bias_merge_count: usize,
+    pub passthrough_count: usize,
+    pub estimated_output_bytes: u64,
+    pub is_sharded: bool,
+    pub shard_count: usize,
+}
+
+/// Inspects a base model and adapter without writing output.
+pub fn dry_run_info(base_model_path: &Path, adapter_path: &Path) -> Result<DryRunInfo> {
+    let adapter_config_path = adapter_path.join("adapter_config.json");
+    let adapter_config = config::AdapterConfig::from_path(&adapter_config_path)?;
+    let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
+
+    io::compute_dry_run_info(base_model_path, &adapter_weights_path, &adapter_config)
 }
 
 /// Merges a LoRA adapter into a base model, writing the result to the output path.

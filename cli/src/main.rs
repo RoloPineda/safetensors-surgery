@@ -40,6 +40,25 @@ fn main() -> Result<()> {
         println!("  target_modules: {:?}", config.target_modules());
         println!("  fan_in_fan_out: {}", config.fan_in_fan_out());
         println!("  bias: {:?}", config.bias());
+
+        let info = safetensors_surgery::dry_run_info(&args.base_model, &args.adapter)
+            .context("failed to inspect model")?;
+        println!("\nBase model:");
+        if info.is_sharded {
+            println!("  type: sharded ({} shards)", info.shard_count);
+        } else {
+            println!("  type: single file");
+        }
+        println!("  total tensors: {}", info.base_tensor_count);
+        println!("\nMerge plan:");
+        println!("  LoRA targets:   {}", info.lora_target_count);
+        println!("  replacements:   {}", info.replacement_count);
+        println!("  bias merges:    {}", info.bias_merge_count);
+        println!("  pass-through:   {}", info.passthrough_count);
+        println!(
+            "  estimated size: {:.1} MB",
+            info.estimated_output_bytes as f64 / (1024.0 * 1024.0)
+        );
         println!("\nDry run complete. No output written.");
         return Ok(());
     }

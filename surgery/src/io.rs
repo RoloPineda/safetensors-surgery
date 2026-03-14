@@ -1,6 +1,6 @@
 //! Memory-mapped I/O and merge orchestration for safetensors files.
 
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, HashMap};
 use std::fs::{self, File};
 use std::io::{BufWriter, Write};
 use std::path::{Path, PathBuf};
@@ -28,6 +28,9 @@ struct MappedSafetensors {
     mmap: Mmap,
     /// Ordered by appearance in the file.
     tensors: Vec<(String, TensorInfo)>,
+    index: HashMap<String, usize>,
+    /// The `__metadata__` key from the safetensors header, if present.
+    metadata: Option<HashMap<String, String>>,
 }
 
 impl MappedSafetensors {
@@ -66,35 +69,37 @@ impl MappedSafetensors {
 
         tensors.sort_by_key(|(_, info)| info.data_start);
 
-        Ok(Self { mmap, tensors })
+        let index: HashMap<String, usize> = tensors
+            .iter()
+            .enumerate()
+            .map(|(i, (name, _))| (name.clone(), i))
+            .collect();
+
+        let metadata = metadata.metadata().clone();
+
+        Ok(Self {
+            mmap,
+            tensors,
+            index,
+            metadata,
+        })
     }
 
     fn tensor_data(&self, name: &str) -> Result<&[u8]> {
-        for (n, info) in &self.tensors {
-            if n == name {
-                return Ok(&self.mmap[info.data_start..info.data_end]);
-            }
-        }
-        Err(SurgeryError::TensorNotFound {
-            name: name.to_string(),
-            location: "file".to_string(),
-        })
+        let info = self.tensor_info(name)?;
+        Ok(&self.mmap[info.data_start..info.data_end])
     }
 
     fn tensor_info(&self, name: &str) -> Result<&TensorInfo> {
-        for (n, info) in &self.tensors {
-            if n == name {
-                return Ok(info);
-            }
+        match self.index.get(name) {
+            Some(&idx) => Ok(&self.tensors[idx].1),
+            None => Err(SurgeryError::TensorNotFound {
+                name: name.to_string(),
+                location: "file".to_string(),
+            }),
         }
-        Err(SurgeryError::TensorNotFound {
-            name: name.to_string(),
-            location: "file".to_string(),
-        })
     }
 }
-
-// ── Shard index (model.safetensors.index.json) ──
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ShardIndex {
@@ -168,12 +173,96 @@ pub(crate) fn resolve_base_model(path: &Path) -> Result<BaseModelSource> {
     )))
 }
 
-// ── Header / dtype helpers ──
+/// Computes dry-run info by inspecting the base model and adapter without merging.
+pub(crate) fn compute_dry_run_info(
+    base_model_path: &Path,
+    adapter_weights_path: &Path,
+    config: &AdapterConfig,
+) -> Result<crate::DryRunInfo> {
+    let source = resolve_base_model(base_model_path)?;
+    let adapter = MappedSafetensors::open(adapter_weights_path)?;
+    let adapter_names: Vec<&str> = adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
+
+    let (base_names, tensor_infos, is_sharded, shard_count) = match &source {
+        BaseModelSource::SingleFile(path) => {
+            let base = MappedSafetensors::open(path)?;
+            let names: Vec<String> = base.tensors.iter().map(|(n, _)| n.clone()).collect();
+            let infos: Vec<TensorInfo> = base.tensors.iter().map(|(_, i)| i.clone()).collect();
+            (names, infos, false, 1)
+        }
+        BaseModelSource::Sharded { dir, index } => {
+            let mut names = Vec::new();
+            let mut infos = Vec::new();
+            let shard_filenames = index.shard_filenames();
+            let shard_count = shard_filenames.len();
+            for shard_filename in &shard_filenames {
+                let shard = MappedSafetensors::open(&dir.join(shard_filename))?;
+                for (name, info) in &shard.tensors {
+                    names.push(name.clone());
+                    infos.push(info.clone());
+                }
+            }
+            (names, infos, true, shard_count)
+        }
+    };
+
+    let base_name_refs: Vec<&str> = base_names.iter().map(|s| s.as_str()).collect();
+    let name_mapping = build_name_mapping(
+        &base_name_refs,
+        &adapter_names,
+        config.target_modules(),
+        config.modules_to_save(),
+    )?;
+
+    let mut lora_target_count = 0;
+    let mut replacement_count = 0;
+    let mut bias_merge_count = 0;
+    let mut estimated_bytes: u64 = 0;
+
+    for (name, info) in base_names.iter().zip(tensor_infos.iter()) {
+        let elem_size = dtype_byte_size(info.dtype).unwrap_or(0);
+        let num_elements: usize = info.shape.iter().product();
+        estimated_bytes += (num_elements * elem_size) as u64;
+
+        if name_mapping.replacement(name).is_some() {
+            replacement_count += 1;
+        } else if name_mapping.is_lora_target(name) {
+            lora_target_count += 1;
+        } else if name_mapping.bias_source(name).is_some() {
+            bias_merge_count += 1;
+        }
+    }
+
+    let base_tensor_count = base_names.len();
+    let passthrough_count =
+        base_tensor_count - lora_target_count - replacement_count - bias_merge_count;
+
+    Ok(crate::DryRunInfo {
+        base_tensor_count,
+        lora_target_count,
+        replacement_count,
+        bias_merge_count,
+        passthrough_count,
+        estimated_output_bytes: estimated_bytes,
+        is_sharded,
+        shard_count,
+    })
+}
 
 /// Returns the serialized header bytes and the total data section size.
-fn build_output_header(tensors: &[(String, TensorInfo)]) -> Result<(Vec<u8>, usize)> {
+fn build_output_header(
+    tensors: &[(String, TensorInfo)],
+    metadata: Option<&HashMap<String, String>>,
+) -> Result<(Vec<u8>, usize)> {
     let mut header_map: BTreeMap<String, serde_json::Value> = BTreeMap::new();
     let mut current_offset: usize = 0;
+
+    if let Some(meta) = metadata {
+        header_map.insert(
+            "__metadata__".to_string(),
+            serde_json::to_value(meta).map_err(SurgeryError::Json)?,
+        );
+    }
 
     for (name, info) in tensors {
         let elem_size = dtype_byte_size(info.dtype)?;
@@ -223,10 +312,7 @@ fn dtype_to_string(dtype: Dtype) -> &'static str {
     }
 }
 
-// ── Tensor processing (shared between single-file and sharded) ──
-
 /// Processes a single tensor: merge, replace, bias-merge, or pass-through.
-/// Returns which category the tensor fell into.
 fn process_tensor(
     name: &str,
     info: &TensorInfo,
@@ -303,7 +389,7 @@ fn process_tensor(
             let merged = merge_bias(&base_f32, &adapter_f32);
             let merged_bytes = f32_to_bytes(&merged, info.dtype)?;
             writer.write_all(&merged_bytes)?;
-            return Ok(TensorAction::BiaseMerged);
+            return Ok(TensorAction::BiasMerged);
         }
     }
 
@@ -315,10 +401,8 @@ enum TensorAction {
     Copied,
     Merged,
     Replaced,
-    BiaseMerged,
+    BiasMerged,
 }
-
-// ── Single-file merge ──
 
 /// Processes one tensor at a time, keeping memory bounded regardless of model size.
 pub fn merge_and_write(
@@ -348,7 +432,8 @@ pub fn merge_and_write(
         .iter()
         .map(|(name, info)| (name.clone(), info.clone()))
         .collect();
-    let (header_bytes, _total_data_size) = build_output_header(&output_tensor_list)?;
+    let (header_bytes, _total_data_size) =
+        build_output_header(&output_tensor_list, base.metadata.as_ref())?;
 
     let output_file = File::create(output_path)?;
     let mut writer = BufWriter::new(output_file);
@@ -395,17 +480,11 @@ fn apply_action(stats: &mut MergeStats, action: TensorAction) {
         TensorAction::Copied => stats.tensors_copied += 1,
         TensorAction::Merged => stats.tensors_merged += 1,
         TensorAction::Replaced => stats.tensors_replaced += 1,
-        TensorAction::BiaseMerged => stats.biases_merged += 1,
+        TensorAction::BiasMerged => stats.biases_merged += 1,
     }
 }
 
-// ── Sharded merge ──
-
 /// Merges a sharded base model with a LoRA adapter, producing sharded output.
-///
-/// Processes one shard at a time: opens the shard, merges its tensors, writes
-/// the output shard, then drops the shard before moving to the next.
-/// Copies the index.json to the output directory with the same weight map.
 pub(crate) fn merge_sharded(
     base_dir: &Path,
     index: &ShardIndex,
@@ -416,24 +495,12 @@ pub(crate) fn merge_sharded(
 ) -> Result<MergeStats> {
     let adapter = MappedSafetensors::open(adapter_weights_path)?;
 
-    // Collect all base tensor names across shards for name mapping.
-    // We need to open each shard briefly to read its header, but the actual
-    // tensor data won't be paged in until accessed during processing.
     let shard_filenames = index.shard_filenames();
-    let mut all_base_names: Vec<String> = Vec::new();
-    let mut total_tensors: usize = 0;
 
-    for shard_filename in &shard_filenames {
-        let shard_path = base_dir.join(shard_filename);
-        let shard = MappedSafetensors::open(&shard_path)?;
-        for (name, _) in &shard.tensors {
-            all_base_names.push(name.clone());
-        }
-        total_tensors += shard.tensors.len();
-        // shard dropped here — will be reopened for processing
-    }
+    let all_base_names: Vec<&str> = index.weight_map.keys().map(|s| s.as_str()).collect();
+    let total_tensors = all_base_names.len();
 
-    let base_name_refs: Vec<&str> = all_base_names.iter().map(|s| s.as_str()).collect();
+    let base_name_refs: Vec<&str> = all_base_names;
     let adapter_names: Vec<&str> = adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
 
     let name_mapping = build_name_mapping(
@@ -464,7 +531,7 @@ pub(crate) fn merge_sharded(
             .iter()
             .map(|(name, info)| (name.clone(), info.clone()))
             .collect();
-        let (header_bytes, _) = build_output_header(&shard_tensor_list)?;
+        let (header_bytes, _) = build_output_header(&shard_tensor_list, shard.metadata.as_ref())?;
 
         let output_file = File::create(&output_shard_path)?;
         let mut writer = BufWriter::new(output_file);
@@ -493,21 +560,17 @@ pub(crate) fn merge_sharded(
         }
 
         writer.flush()?;
-        // shard mmap dropped here before opening next shard
     }
 
     if let Some(progress) = &progress {
         progress(total_tensors, total_tensors);
     }
 
-    // Write the output index.json with the same weight_map
     write_output_index(index, output_dir)?;
 
     Ok(stats)
 }
 
-/// Writes a `model.safetensors.index.json` to the output directory,
-/// preserving the original weight map.
 fn write_output_index(index: &ShardIndex, output_dir: &Path) -> Result<()> {
     let output_index = serde_json::json!({
         "metadata": {},
@@ -550,7 +613,7 @@ mod tests {
             .collect();
 
         let serialized = serialize(tensor_views, &None).unwrap();
-        std::fs::write(path, serialized).unwrap();
+        fs::write(path, serialized).unwrap();
     }
 
     #[test]
@@ -673,7 +736,6 @@ mod tests {
             )],
         );
 
-        // Write index.json
         let index_json = serde_json::json!({
             "metadata": {},
             "weight_map": {
@@ -687,7 +749,6 @@ mod tests {
         )
         .unwrap();
 
-        // Adapter
         write_safetensors(
             &adapter_dir.join("adapter_model.safetensors"),
             vec![
@@ -730,7 +791,6 @@ mod tests {
         assert_eq!(stats.tensors_merged, 1);
         assert_eq!(stats.tensors_copied, 1);
 
-        // Verify output shard 1 has merged q_proj
         let shard1 =
             MappedSafetensors::open(&output_dir.join("model-00001-of-00002.safetensors")).unwrap();
         assert_eq!(shard1.tensors.len(), 1);
@@ -745,13 +805,11 @@ mod tests {
         assert!((q_f32[[0, 0]] - 2.0).abs() < 0.01);
         assert!((q_f32[[1, 1]] - 2.0).abs() < 0.01);
 
-        // Verify output shard 2 has unchanged embed_tokens
         let shard2 =
             MappedSafetensors::open(&output_dir.join("model-00002-of-00002.safetensors")).unwrap();
         assert_eq!(shard2.tensors.len(), 1);
         assert!(shard2.tensor_info("model.embed_tokens.weight").is_ok());
 
-        // Verify output index.json exists and has correct mapping
         let out_index =
             ShardIndex::from_path(&output_dir.join("model.safetensors.index.json")).unwrap();
         assert_eq!(out_index.weight_map.len(), 2);

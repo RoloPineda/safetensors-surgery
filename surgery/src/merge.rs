@@ -112,7 +112,6 @@ pub fn merge_lora(
     scaling: f32,
     fan_in_fan_out: bool,
 ) -> Array2<f32> {
-    // [out_features, r] @ [r, in_features] = [out_features, in_features]
     let delta = if fan_in_fan_out {
         lora_b.dot(&lora_a.t())
     } else {
