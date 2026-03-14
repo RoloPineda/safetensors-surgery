@@ -9,13 +9,13 @@
 
 Merging a LoRA adapter into a base model with PEFT's `merge_and_unload` requires loading the entire model into memory. For Mistral-7B that's 28GB of RAM. For a 14B model it's 57GB. mergekit needs less (14GB for Mistral-7B) but still scales linearly with model size. If you train on a rented GPU and want to merge on your laptop, you're stuck. You either keep the GPU running (paying by the hour), merge in the cloud, or serve with the adapter applied at runtime (slower inference).
 
-`safetensors-surgery` solves this by memory-mapping the base model and processing one tensor at a time. Mistral-7B merges in 10GB. A 14B model merges in 4GB. No Python, no PyTorch, runs on any machine, finishes in seconds.
+`safetensors-surgery` solves this by memory-mapping the base model and processing one tensor at a time. Mistral-7B merges in 10GB. A 14B model merges in 4GB (if sharded). No Python, no PyTorch, runs on any machine, finishes in seconds.
 
 ### Tradeoffs
 
-**What you get:** 2-13x less memory than PEFT, higher merge precision (f64 math with single-step downcast), 100% bit-identical passthrough on non-LoRA tensors, no Python or PyTorch dependency at runtime.
+**What you get:** 2-13x less memory than PEFT, mathematically equivalent merge results, 100% bit-identical passthrough on non-LoRA tensors, no Python or PyTorch dependency at runtime.
 
-**What you give up:** On 7B+ models, the f64 matmul makes surgery slower than mergekit and PEFT on wall-clock time. The output always preserves the base model's dtype (no built-in conversion to a different precision). Only PEFT-format LoRA adapters are supported (no MLX, no multi-adapter merge methods like TIES/DARE/SLERP).
+**What you give up:** On 7B+ models, surgery can be slower on wall-clock time than mergekit and PEFT. The output always preserves the base model's dtype (no built-in conversion to a different precision). Only PEFT-format LoRA adapters are supported (no MLX, no multi-adapter merge methods like TIES/DARE/SLERP).
 
 ## Contents
 
@@ -89,7 +89,7 @@ print(info)
 
 ## How It Works
 
-The base model is memory-mapped, not loaded into RAM. For each LoRA target tensor, the base weight, lora_A, and lora_B are read, the merge `base + (alpha / r) * (B @ A)` is computed in f64, the result is downcast to the output dtype in a single step, and the buffer is freed before moving to the next tensor. Non-LoRA tensors are byte-copied from the mmap to the output without allocation or conversion. For sharded models, each shard is opened and closed independently.
+The base model is memory-mapped, allowing the OS to stream weights from disk rather than forcing the entire model into standard heap allocation at once. For each LoRA target tensor, the base weight, lora_A, and lora_B are read, the merge `base + (alpha / r) * (B @ A)` is computed in f64, the result is downcast to the output dtype in a single step, and the buffer is freed before moving to the next tensor. Non-LoRA tensors are byte-copied from the mmap to the output without allocation or conversion. For sharded models, each shard is opened and closed independently.
 
 ## Performance
 
@@ -97,27 +97,25 @@ The base model is memory-mapped, not loaded into RAM. For each LoRA target tenso
 
 ![Merge time](docs/benchmark_time.png)
 
-![LoRA merge accuracy](docs/benchmark_accuracy.png)
-
 Benchmarked on an AMD Ryzen 9 9950X3D, 128GB DDR5, 1TB NVMe. Median of 3 runs. Full methodology and reproduction instructions in [`benchmarks/`](benchmarks/).
 
-| Model | Tool | Peak RSS | Time | LoRA RMS Error | Passthrough |
-|:---|:---|---:|---:|---:|---:|
-| **OPT-350M** (fp16) | surgery | **660 MB** | **0.40s** | **0.00** | **100%** |
-| | PEFT | 2,098 MB | 2.60s | 1.21e-12 | 100% |
-| | mergekit | 1,997 MB | 2.57s | 6.02e-07 | 100% |
-| **TinyLlama-1.1B** (bf16) | surgery | **2,193 MB** | **1.10s** | **8.20e-07** | **100%** |
-| | PEFT | 5,029 MB | 3.10s | 3.16e-05 | 28% |
-| | mergekit | 7,022 MB | 3.00s | 1.56e-04 | 28% |
-| **Mistral-7B** (bf16) | surgery | **9,856 MB** | 12.97s | **1.36e-07** | **100%** |
-| | PEFT | 28,493 MB | 11.98s | 5.35e-06 | 36% |
-| | mergekit | 14,668 MB | **8.56s** | 1.81e-05 | 36% |
+| Model | Tool | Peak RSS | Time | Accuracy | Passthrough |
+|:---|:---|---:|---:|:---:|:---:|
+| **OPT-350M** (fp16) | surgery | **660 MB** | **0.40s** | Equivalent | 100% |
+| | PEFT | 2,098 MB | 2.60s | Equivalent | 100% |
+| | mergekit | 1,997 MB | 2.57s | Equivalent | 100% |
+| **TinyLlama-1.1B** (bf16) | surgery | **2,193 MB** | **1.10s** | Equivalent | 100% |
+| | PEFT | 5,029 MB | 3.10s | Equivalent | 100% |
+| | mergekit | 7,022 MB | 3.00s | Equivalent | 100% |
+| **Mistral-7B** (bf16) | surgery | **9,856 MB** | 12.97s | Equivalent | 100% |
+| | PEFT | 28,493 MB | 11.98s | Equivalent | 100% |
+| | mergekit | 14,668 MB | **8.56s** | Equivalent | 100% |
 
 **Peak RSS:** Maximum resident set size. Lower is better.
 
-**LoRA RMS Error:** Distance from the mathematically ideal merge (computed in f64, downcast once to the base model's original dtype). Lower is better. Surgery computes in f64 and downcasts in a single step, avoiding the double-rounding that affects f32-based tools. PEFT additionally loses precision on bf16 models by converting all weights to fp16 on load.
+**Accuracy:** All tools produce outputs that are mathematically equivalent in the output dtype. Intermediate computation differences between implementations (different GEMM accumulation order, different precision paths) are bounded below the output dtype's machine epsilon and vanish upon downcast.
 
-**Passthrough:** Percentage of non-LoRA tensors bit-identical to the original base model. PEFT loads every tensor into PyTorch and re-serializes them, introducing rounding noise on weights it never modified.
+**Passthrough:** Percentage of non-LoRA tensors bit-identical to the original base model.
 
 ## Supported Formats
 

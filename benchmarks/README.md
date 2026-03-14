@@ -53,6 +53,7 @@ benchmarks/compare.py options:
   --tools TOOL [TOOL ...]      Which tools (surgery, peft, peft_low_mem, mergekit)
   --runs N                     Iterations per tool (default: 3, reports median)
   --output PATH                Output chart path (default: benchmarks/results.png)
+  --drop-caches                Drop OS page cache before each run (requires passwordless sudo)
 ```
 
 Run only specific tools:
@@ -78,11 +79,11 @@ python3 benchmarks/compare.py --models opt-350m --runs 1
 
 **Time (s):** Wall-clock time including both merge and save-to-disk. Median of N runs. Includes process startup for all tools (Rust binary startup for surgery, Python interpreter startup for PEFT/mergekit).
 
-**LoRA max_err:** Maximum absolute error of any single element in any LoRA target tensor, compared to the f64 gold standard (merge computed in f64, downcast once to the base model's original dtype).
+**LoRA Max Err:** Maximum intermediate f64 error of any single element in any LoRA target tensor, compared to the f64 gold standard. This measures implementation differences (GEMM accumulation order, precision paths) before downcast.
 
-**LoRA RMS:** Mean RMS error across all LoRA target tensors. Lower is better.
+**Accuracy Status:** Whether the intermediate error is bounded by a safe margin of the output dtype's machine epsilon. "Equivalent" means the difference vanishes when downcast to the output dtype, producing identical bytes. All tools should show "Equivalent."
 
-**Passthrough:** Percentage of non-LoRA tensors that are bit-identical to the original base model. Surgery achieves 100% because it copies mmap byte ranges directly. PEFT scores lower because it loads all tensors into PyTorch and re-saves them, introducing fp16/bf16 roundtrip noise even on weights it never modified.
+**Passthrough:** Percentage of non-LoRA tensors that are bit-identical to the original base model.
 
 ## Sharing results
 
