@@ -153,10 +153,11 @@ pub fn f64_to_bytes(array: &Array2<f64>, dtype: Dtype) -> Result<Vec<u8>> {
 
 /// Adds adapter bias values to base bias values element-wise.
 #[must_use]
-pub fn merge_bias(base_bias: &Array2<f32>, adapter_bias: &Array2<f32>) -> Array2<f32> {
-    base_bias + adapter_bias
+pub fn merge_bias(base_bias: &Array2<f32>, adapter_bias: &Array2<f32>) -> Array2<f64> {
+    let base_f64 = base_bias.mapv(|v| v as f64);
+    let adapter_f64 = adapter_bias.mapv(|v| v as f64);
+    base_f64 + &adapter_f64
 }
-
 #[cfg(test)]
 mod tests {
     use super::*;
