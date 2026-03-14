@@ -64,20 +64,34 @@ jobs:
   wheels:
     name: Python wheels
     runs-on: ubuntu-latest
-    if: hashFiles('bindings/Cargo.toml') != ''
     strategy:
       matrix:
         python-version: ["3.12", "3.13"]
     steps:
       - uses: actions/checkout@v4
+      - name: Check for bindings crate
+        id: check
+        run: |
+          if [ -f bindings/Cargo.toml ]; then
+            echo "exists=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "exists=false" >> "$GITHUB_OUTPUT"
+            echo "Bindings crate not found, skipping wheel build"
+          fi
       - uses: dtolnay/rust-toolchain@stable
+        if: steps.check.outputs.exists == 'true'
       - uses: Swatinem/rust-cache@v2
+        if: steps.check.outputs.exists == 'true'
       - uses: actions/setup-python@v5
+        if: steps.check.outputs.exists == 'true'
         with:
           python-version: ${{ matrix.python-version }}
       - run: pip install maturin
+        if: steps.check.outputs.exists == 'true'
       - run: maturin build --release --manifest-path bindings/Cargo.toml --interpreter python${{ matrix.python-version }}
+        if: steps.check.outputs.exists == 'true'
       - uses: actions/upload-artifact@v4
+        if: steps.check.outputs.exists == 'true'
         with:
           name: wheel-linux-py${{ matrix.python-version }}
           path: target/wheels/*.whl
