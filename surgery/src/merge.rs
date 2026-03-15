@@ -17,9 +17,9 @@ pub fn bytes_to_f32(
 ) -> Result<Array2<f32>> {
     if shape.len() != 2 {
         return Err(SurgeryError::ShapeMismatch {
-            name: name.to_string(),
-            expected: vec![0, 0],
-            got: shape.to_vec(),
+            name: format!("{name} (expected 2D)"),
+            expected: vec![2],
+            got: vec![shape.len()],
         });
     }
     let (rows, cols) = (shape[0], shape[1]);
@@ -103,6 +103,55 @@ pub fn f32_to_bytes(array: &Array2<f32>, dtype: Dtype) -> Result<Vec<u8>> {
     }
 }
 
+/// Computes `W_base + (alpha / r) * (lora_B @ lora_A)`.
+///
+/// When `fan_in_fan_out` is true, `lora_A` is transposed before the matmul.
+pub fn merge_lora(
+    base: &Array2<f32>,
+    lora_a: &Array2<f32>,
+    lora_b: &Array2<f32>,
+    scaling: f32,
+    fan_in_fan_out: bool,
+) -> Result<Array2<f32>> {
+    let a_cols = if fan_in_fan_out {
+        lora_a.nrows()
+    } else {
+        lora_a.ncols()
+    };
+    if lora_b.ncols()
+        != (if fan_in_fan_out {
+            lora_a.ncols()
+        } else {
+            lora_a.nrows()
+        })
+    {
+        return Err(SurgeryError::ShapeMismatch {
+            name: "LoRA matmul inner dimension".to_string(),
+            expected: vec![lora_b.ncols()],
+            got: vec![if fan_in_fan_out {
+                lora_a.ncols()
+            } else {
+                lora_a.nrows()
+            }],
+        });
+    }
+    if lora_b.nrows() != base.nrows() || a_cols != base.ncols() {
+        return Err(SurgeryError::ShapeMismatch {
+            name: "LoRA delta vs base".to_string(),
+            expected: vec![base.nrows(), base.ncols()],
+            got: vec![lora_b.nrows(), a_cols],
+        });
+    }
+
+    let delta = if fan_in_fan_out {
+        lora_b.dot(&lora_a.t())
+    } else {
+        lora_b.dot(lora_a)
+    };
+
+    Ok(base + &(delta * scaling))
+}
+
 /// Converts raw tensor bytes to an `Array2<f64>`, upcasting from the storage dtype.
 pub fn bytes_to_f64(
     bytes: &[u8],
@@ -112,9 +161,9 @@ pub fn bytes_to_f64(
 ) -> Result<Array2<f64>> {
     if shape.len() != 2 {
         return Err(SurgeryError::ShapeMismatch {
-            name: name.to_string(),
-            expected: vec![0, 0],
-            got: shape.to_vec(),
+            name: format!("{name} (expected 2D)"),
+            expected: vec![2],
+            got: vec![shape.len()],
         });
     }
     let (rows, cols) = (shape[0], shape[1]);
@@ -178,21 +227,17 @@ pub fn bytes_to_f64(
 /// Merges LoRA weights into base tensor bytes with f64-accurate matmul.
 ///
 /// When `low_memory` is false (default): materializes the full delta matrix
-/// in f64, then fuses the add+convert pass row by row. Faster but uses more
-/// memory (~1.88GB for the largest tensors in a 70B model).
+/// in f64, then fuses the add+convert pass row by row. Faster but peak memory
+/// scales with the largest tensor dimension.
 ///
-/// When `low_memory` is true: tiles the matmul in 512-row chunks using
-/// `bytes_to_f32` and `f32_to_bytes` per tile. Uses roughly 150MB per tile
-/// instead of the full delta, at the cost of ~1.5x slower speed.
+/// When `low_memory` is true: tiles the matmul in fixed-size chunks using
+/// `bytes_to_f32` and `f32_to_bytes` per tile. Bounded memory at the cost
+/// of slower speed due to per-tile allocation overhead.
 ///
-/// Both paths accumulate the matmul in f64; the final base+delta addition
-/// is done in f32 (low-memory) or f32 per-element (non-low-memory).
-///
-/// When `fan_in_fan_out` is true, the delta (lora_B @ lora_A) is transposed
-/// before adding to the base weight, matching PEFT's behavior for Conv1D/GPT-2
-/// layers.
-// Justified: streaming function needs all merge parameters plus I/O target;
-// a parameter struct would obscure the data flow for a single call site.
+/// Both paths accumulate the matmul in f64 and perform the final base+delta
+/// addition in f64 before downcasting, preserving numerical accuracy.
+// 9 parameters needed: base data, both LoRA matrices, scaling, fan_in_fan_out,
+// shape, dtype, memory mode, and writer. A struct would obscure the call site.
 #[allow(clippy::too_many_arguments)]
 pub fn streaming_lora_merge_write(
     base_bytes: &[u8],
@@ -207,9 +252,9 @@ pub fn streaming_lora_merge_write(
 ) -> Result<()> {
     if base_shape.len() != 2 {
         return Err(SurgeryError::ShapeMismatch {
-            name: "base tensor".to_string(),
-            expected: vec![0, 0],
-            got: base_shape.to_vec(),
+            name: "base tensor (expected 2D)".to_string(),
+            expected: vec![2],
+            got: vec![base_shape.len()],
         });
     }
     let rows = base_shape[0];
@@ -235,40 +280,46 @@ pub fn streaming_lora_merge_write(
         });
     }
 
-    // Validate LoRA matrix dimensions against base tensor.
-    // When fan_in_fan_out is true, the base weight is stored as [in_features, out_features]
-    // and the delta = (B @ A)^T = A^T @ B^T has shape [in_features, out_features].
-    // B is [out_features, r], A is [r, in_features].
-    let (expected_b_rows, expected_a_cols) = if fan_in_fan_out {
-        // Base is [in_features, out_features]; delta = (B @ A)^T = A^T @ B^T
-        // B is [out_features, r], A is [r, in_features]
-        (cols, rows)
-    } else {
-        // Base is [out_features, in_features]; delta = B @ A
-        // B is [out_features, r], A is [r, in_features]
-        (rows, cols)
-    };
-    if lora_b.nrows() != expected_b_rows {
+    // Validate LoRA dimensions before matmul to return a clean error
+    // instead of panicking inside ndarray's dot().
+    if lora_b.nrows() != rows {
         return Err(SurgeryError::ShapeMismatch {
-            name: "lora_B rows vs base".to_string(),
-            expected: vec![expected_b_rows],
+            name: "lora_B rows vs base rows".to_string(),
+            expected: vec![rows],
             got: vec![lora_b.nrows()],
         });
     }
-    if lora_a.ncols() != expected_a_cols {
+    let a_out_cols = if fan_in_fan_out {
+        lora_a.nrows()
+    } else {
+        lora_a.ncols()
+    };
+    if a_out_cols != cols {
         return Err(SurgeryError::ShapeMismatch {
-            name: "lora_A cols vs base".to_string(),
-            expected: vec![expected_a_cols],
-            got: vec![lora_a.ncols()],
+            name: "lora_A output cols vs base cols".to_string(),
+            expected: vec![cols],
+            got: vec![a_out_cols],
         });
     }
-    if lora_b.ncols() != lora_a.nrows() {
+    let inner_b = lora_b.ncols();
+    let inner_a = if fan_in_fan_out {
+        lora_a.ncols()
+    } else {
+        lora_a.nrows()
+    };
+    if inner_b != inner_a {
         return Err(SurgeryError::ShapeMismatch {
             name: "LoRA matmul inner dimension".to_string(),
-            expected: vec![lora_b.ncols()],
-            got: vec![lora_a.nrows()],
+            expected: vec![inner_b],
+            got: vec![inner_a],
         });
     }
+
+    let a_view = if fan_in_fan_out {
+        lora_a.t()
+    } else {
+        lora_a.view()
+    };
 
     if low_memory {
         const TILE_ROWS: usize = 512;
@@ -277,16 +328,8 @@ pub fn streaming_lora_merge_write(
             let end = (start + TILE_ROWS).min(rows);
             let tile_rows = end - start;
 
-            let delta_f64 = if fan_in_fan_out {
-                // delta = (B @ A)^T = A^T @ B^T; tile over rows of A^T (= cols of A).
-                // A^T[start..end, :] is A[:, start..end]^T, shape [tile_rows, r].
-                // Result: [tile_rows, out_features] = [tile_rows, cols] (since cols = out_features for fan_in_fan_out base).
-                let tile_a_t = lora_a.slice(s![.., start..end]).t().to_owned();
-                tile_a_t.dot(&lora_b.t()) * scaling
-            } else {
-                let tile_b = lora_b.slice(s![start..end, ..]).to_owned();
-                tile_b.dot(lora_a) * scaling
-            };
+            let tile_b = lora_b.slice(s![start..end, ..]).to_owned();
+            let delta_f64 = tile_b.dot(&a_view) * scaling;
             let delta_f32 = delta_f64.mapv(|v| v as f32);
 
             let base_offset = start * row_bytes;
@@ -301,12 +344,7 @@ pub fn streaming_lora_merge_write(
             start = end;
         }
     } else {
-        let delta_f64 = if fan_in_fan_out {
-            // delta = (B @ A)^T = A^T @ B^T, shape [in_features, out_features]
-            lora_a.t().dot(&lora_b.t()) * scaling
-        } else {
-            lora_b.dot(lora_a) * scaling
-        };
+        let delta_f64 = lora_b.dot(&a_view) * scaling;
 
         let delta_shape = delta_f64.shape();
         if delta_shape[0] != rows || delta_shape[1] != cols {
@@ -317,17 +355,9 @@ pub fn streaming_lora_merge_write(
             });
         }
 
-        // Ensure contiguous layout after potential transpose.
-        let delta_owned;
-        let delta = match delta_f64.as_slice() {
-            Some(s) => s,
-            None => {
-                delta_owned = delta_f64.as_standard_layout().into_owned();
-                delta_owned.as_slice().ok_or_else(|| {
-                    SurgeryError::Safetensors("delta array is not contiguous in memory".to_string())
-                })?
-            }
-        };
+        let delta = delta_f64.as_slice().ok_or_else(|| {
+            SurgeryError::Safetensors("delta array is not contiguous in memory".to_string())
+        })?;
 
         let mut out_buf: Vec<u8> = vec![0u8; row_bytes];
 
@@ -343,7 +373,7 @@ pub fn streaming_lora_merge_write(
                         .zip(out_buf.chunks_exact_mut(2))
                     {
                         let base_val = f16::from_le_bytes([in_chunk[0], in_chunk[1]]).to_f32();
-                        let merged = base_val + d as f32;
+                        let merged = (base_val as f64 + d) as f32;
                         out_chunk.copy_from_slice(&f16::from_f32(merged).to_le_bytes());
                     }
                 }
@@ -354,7 +384,7 @@ pub fn streaming_lora_merge_write(
                         .zip(out_buf.chunks_exact_mut(2))
                     {
                         let base_val = bf16::from_le_bytes([in_chunk[0], in_chunk[1]]).to_f32();
-                        let merged = base_val + d as f32;
+                        let merged = (base_val as f64 + d) as f32;
                         out_chunk.copy_from_slice(&bf16::from_f32(merged).to_le_bytes());
                     }
                 }
@@ -370,13 +400,13 @@ pub fn streaming_lora_merge_write(
                             in_chunk[2],
                             in_chunk[3],
                         ]);
-                        let merged = base_val + d as f32;
+                        let merged = (base_val as f64 + d) as f32;
                         out_chunk.copy_from_slice(&merged.to_le_bytes());
                     }
                 }
                 _ => {
                     return Err(SurgeryError::UnsupportedDtype {
-                        name: "output".to_string(),
+                        name: "merge output".to_string(),
                         dtype: format!("{dtype:?}"),
                     });
                 }
@@ -457,6 +487,42 @@ mod tests {
     }
 
     #[test]
+    fn merge_lora_basic() {
+        let base = Array2::from_shape_vec((2, 3), vec![1.0, 0.0, 0.0, 0.0, 1.0, 0.0]).unwrap();
+        let lora_a = Array2::from_shape_vec((1, 3), vec![1.0, 1.0, 1.0]).unwrap();
+        let lora_b = Array2::from_shape_vec((2, 1), vec![1.0, 1.0]).unwrap();
+        let scaling = 2.0;
+
+        let merged = merge_lora(&base, &lora_a, &lora_b, scaling, false).unwrap();
+
+        // delta = [[1],[1]] @ [[1,1,1]] = [[1,1,1],[1,1,1]]
+        // merged = base + 2.0 * delta = [[3,2,2],[2,3,2]]
+        assert_eq!(merged[[0, 0]], 3.0);
+        assert_eq!(merged[[0, 1]], 2.0);
+        assert_eq!(merged[[0, 2]], 2.0);
+        assert_eq!(merged[[1, 0]], 2.0);
+        assert_eq!(merged[[1, 1]], 3.0);
+        assert_eq!(merged[[1, 2]], 2.0);
+    }
+
+    #[test]
+    fn merge_lora_fan_in_fan_out() {
+        let base = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap();
+        let lora_a = Array2::from_shape_vec((2, 1), vec![1.0, 2.0]).unwrap();
+        let lora_b = Array2::from_shape_vec((2, 1), vec![3.0, 4.0]).unwrap();
+        let scaling = 1.0;
+
+        let merged = merge_lora(&base, &lora_a, &lora_b, scaling, true).unwrap();
+
+        // A^T = [[1, 2]], B @ A^T = [[3,6],[4,8]]
+        // merged = base + delta = [[4,6],[4,9]]
+        assert_eq!(merged[[0, 0]], 4.0);
+        assert_eq!(merged[[0, 1]], 6.0);
+        assert_eq!(merged[[1, 0]], 4.0);
+        assert_eq!(merged[[1, 1]], 9.0);
+    }
+
+    #[test]
     fn merge_bias_basic() {
         let base = Array2::from_shape_vec((1, 4), vec![1.0, 2.0, 3.0, 4.0]).unwrap();
         let adapter = Array2::from_shape_vec((1, 4), vec![0.1, 0.2, 0.3, 0.4]).unwrap();
@@ -485,6 +551,19 @@ mod tests {
         let bytes = vec![0u8; 8];
         let err = bytes_to_f32(&bytes, Dtype::F32, &[2], "test_tensor").unwrap_err();
         assert!(err.to_string().contains("shape mismatch"));
+    }
+
+    #[test]
+    fn merge_lora_scaling_factor() {
+        // Verify scaling = alpha/r is correctly applied
+        let base = Array2::from_shape_vec((2, 2), vec![0.0, 0.0, 0.0, 0.0]).unwrap();
+        let lora_a = Array2::from_shape_vec((1, 2), vec![1.0, 1.0]).unwrap();
+        let lora_b = Array2::from_shape_vec((2, 1), vec![1.0, 1.0]).unwrap();
+        // scaling = alpha/r = 16/8 = 2.0
+        let merged = merge_lora(&base, &lora_a, &lora_b, 2.0, false).unwrap();
+        // delta = [[1,1],[1,1]], merged = 0 + 2.0 * delta = [[2,2],[2,2]]
+        assert_eq!(merged[[0, 0]], 2.0);
+        assert_eq!(merged[[1, 1]], 2.0);
     }
 
     #[test]

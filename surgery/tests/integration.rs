@@ -80,7 +80,7 @@ fn merge_two_4x4_lora_targets() {
         ],
     );
 
-    // ── Adapter: rank=2, alpha=4, scaling = alpha/r = 2.0 ──
+    // Adapter: rank=2, alpha=4, scaling = alpha/r = 2.0
     //
     // q_proj lora_A [2, 4]:  [[1, 0, 0, 0],
     //                         [0, 1, 0, 0]]

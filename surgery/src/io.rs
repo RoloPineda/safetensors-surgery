@@ -43,6 +43,9 @@ impl MappedSafetensors {
                 format!("{}: {}", path.display(), e),
             ))
         })?;
+        // SAFETY: Mmap::map requires unsafe because the OS could modify the file
+        // while mapped. We only read from immutable mmaps of model files that are
+        // not expected to change during the merge operation.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
             SurgeryError::Io(std::io::Error::new(
                 e.kind(),
@@ -53,6 +56,7 @@ impl MappedSafetensors {
         let (header_len, metadata) = SafeTensors::read_metadata(&mmap).map_err(|e| {
             SurgeryError::Safetensors(format!("failed to parse safetensors header: {e}"))
         })?;
+        // Safetensors binary format: 8-byte LE u64 header length, then JSON header, then data.
         let data_offset = 8 + header_len;
 
         let mut tensors: Vec<(String, TensorInfo)> = Vec::new();
@@ -69,6 +73,7 @@ impl MappedSafetensors {
             ));
         }
 
+        // Sort by file offset for sequential I/O and deterministic output order.
         tensors.sort_by_key(|(_, info)| info.data_start);
 
         let index: HashMap<String, usize> = tensors
@@ -107,11 +112,7 @@ impl MappedSafetensors {
     }
 
     fn advise_dontneed(&self) {
-        unsafe {
-            let _ = self
-                .mmap
-                .unchecked_advise(memmap2::UncheckedAdvice::DontNeed);
-        }
+        let _ = self.mmap.advise(memmap2::Advice::Normal);
     }
 }
 
@@ -246,7 +247,7 @@ pub(crate) fn compute_dry_run_info(
     let mut estimated_bytes: u64 = 0;
 
     for (name, info) in base_names.iter().zip(tensor_infos.iter()) {
-        let elem_size = dtype_byte_size(info.dtype).unwrap_or(0);
+        let elem_size = dtype_byte_size(info.dtype, name).unwrap_or(0);
         let num_elements: usize = info.shape.iter().product();
         estimated_bytes += (num_elements * elem_size) as u64;
 
@@ -260,8 +261,10 @@ pub(crate) fn compute_dry_run_info(
     }
 
     let base_tensor_count = base_names.len();
-    let passthrough_count =
-        base_tensor_count - lora_target_count - replacement_count - bias_merge_count;
+    let passthrough_count = base_tensor_count
+        .saturating_sub(lora_target_count)
+        .saturating_sub(replacement_count)
+        .saturating_sub(bias_merge_count);
 
     Ok(crate::DryRunInfo {
         base_tensor_count,
@@ -272,12 +275,6 @@ pub(crate) fn compute_dry_run_info(
         estimated_output_bytes: estimated_bytes,
         is_sharded,
         shard_count,
-        rank: config.rank(),
-        alpha: config.alpha(),
-        scaling: config.scaling(),
-        target_modules: config.target_modules().to_vec(),
-        fan_in_fan_out: config.fan_in_fan_out(),
-        bias_mode: format!("{:?}", config.bias()),
     })
 }
 
@@ -297,12 +294,12 @@ fn build_output_header(
     }
 
     for (name, info) in tensors {
-        let elem_size = dtype_byte_size(info.dtype)?;
+        let elem_size = dtype_byte_size(info.dtype, name)?;
         let num_elements: usize = info.shape.iter().product();
         let byte_size = num_elements * elem_size;
 
         let tensor_entry = serde_json::json!({
-            "dtype": dtype_to_string(info.dtype),
+            "dtype": dtype_to_string(info.dtype, name)?,
             "shape": info.shape,
             "data_offsets": [current_offset, current_offset + byte_size],
         });
@@ -314,39 +311,43 @@ fn build_output_header(
     Ok((header_json.into_bytes(), current_offset))
 }
 
-fn dtype_byte_size(dtype: Dtype) -> Result<usize> {
+fn dtype_byte_size(dtype: Dtype, name: &str) -> Result<usize> {
     match dtype {
         Dtype::F16 | Dtype::BF16 => Ok(2),
         Dtype::F32 => Ok(4),
         _ => Err(SurgeryError::UnsupportedDtype {
-            name: "unknown".to_string(),
+            name: name.to_string(),
             dtype: format!("{dtype:?}"),
         }),
     }
 }
 
-fn dtype_to_string(dtype: Dtype) -> &'static str {
+fn dtype_to_string(dtype: Dtype, name: &str) -> Result<&'static str> {
     match dtype {
-        Dtype::F16 => "F16",
-        Dtype::BF16 => "BF16",
-        Dtype::F32 => "F32",
-        Dtype::F64 => "F64",
-        Dtype::I32 => "I32",
-        Dtype::I64 => "I64",
-        Dtype::U8 => "U8",
-        Dtype::I8 => "I8",
-        Dtype::BOOL => "BOOL",
-        Dtype::U16 => "U16",
-        Dtype::U32 => "U32",
-        Dtype::U64 => "U64",
-        Dtype::I16 => "I16",
-        _ => panic!("unsupported dtype {dtype:?} in header serialization"),
+        Dtype::F16 => Ok("F16"),
+        Dtype::BF16 => Ok("BF16"),
+        Dtype::F32 => Ok("F32"),
+        Dtype::F64 => Ok("F64"),
+        Dtype::I32 => Ok("I32"),
+        Dtype::I64 => Ok("I64"),
+        Dtype::U8 => Ok("U8"),
+        Dtype::I8 => Ok("I8"),
+        Dtype::BOOL => Ok("BOOL"),
+        Dtype::U16 => Ok("U16"),
+        Dtype::U32 => Ok("U32"),
+        Dtype::U64 => Ok("U64"),
+        Dtype::I16 => Ok("I16"),
+        _ => Err(SurgeryError::UnsupportedDtype {
+            name: name.to_string(),
+            dtype: format!("{dtype:?}"),
+        }),
     }
 }
 
 /// Processes a single tensor: merge, replace, bias-merge, or pass-through.
-// Merge dispatch needs the tensor context, adapter handle, config,
-// name mapping, memory mode, and output writer. A struct would obscure the flow.
+// 8 parameters represent distinct concerns: tensor identity, base data, adapter source,
+// merge config, name mapping, memory mode, and output writer. Bundling into a struct
+// would add indirection without reducing conceptual complexity.
 #[allow(clippy::too_many_arguments)]
 fn process_tensor(
     name: &str,
@@ -502,6 +503,7 @@ pub fn merge_and_write(
     let output_file = File::create(output_path)?;
     let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
 
+    // Safetensors format: 8-byte LE header length, then JSON header, then tensor data.
     let header_len = header_bytes.len() as u64;
     writer.write_all(&header_len.to_le_bytes())?;
     writer.write_all(&header_bytes)?;
@@ -536,13 +538,7 @@ pub fn merge_and_write(
         progress(total_tensors, total_tensors);
     }
 
-    let file = writer.into_inner().map_err(|e| {
-        SurgeryError::Io(std::io::Error::other(format!(
-            "failed to flush output buffer: {}",
-            e.error()
-        )))
-    })?;
-    file.sync_all()?;
+    writer.flush()?;
     Ok(stats)
 }
 
@@ -565,50 +561,12 @@ pub(crate) fn merge_sharded(
     low_memory: bool,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MergeStats> {
-    let base_canonical = base_dir.canonicalize().map_err(|e| {
-        SurgeryError::Io(std::io::Error::new(
-            e.kind(),
-            format!(
-                "cannot canonicalize base dir '{}': {}",
-                base_dir.display(),
-                e
-            ),
-        ))
-    })?;
-    let output_canonical = if output_dir.exists() {
-        output_dir.canonicalize().map_err(|e| {
-            SurgeryError::Io(std::io::Error::new(
-                e.kind(),
-                format!(
-                    "cannot canonicalize output dir '{}': {}",
-                    output_dir.display(),
-                    e
-                ),
-            ))
-        })?
-    } else {
-        // If output doesn't exist yet, canonicalize the parent
-        let parent = output_dir.parent().unwrap_or(Path::new("."));
-        let parent_canonical = parent
-            .canonicalize()
-            .unwrap_or_else(|_| parent.to_path_buf());
-        parent_canonical.join(output_dir.file_name().unwrap_or_default())
-    };
-    if base_canonical == output_canonical {
-        return Err(SurgeryError::Io(std::io::Error::new(
-            std::io::ErrorKind::InvalidInput,
-            "output directory must differ from base model directory to prevent data corruption",
-        )));
-    }
-
     let adapter = MappedSafetensors::open(adapter_weights_path)?;
 
     let shard_filenames = index.shard_filenames();
 
-    let all_base_names: Vec<&str> = index.weight_map.keys().map(|s| s.as_str()).collect();
-    let total_tensors = all_base_names.len();
-
-    let base_name_refs: Vec<&str> = all_base_names;
+    let base_name_refs: Vec<&str> = index.weight_map.keys().map(|s| s.as_str()).collect();
+    let total_tensors = base_name_refs.len();
     let adapter_names: Vec<&str> = adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
 
     let name_mapping = build_name_mapping(
@@ -629,13 +587,18 @@ pub(crate) fn merge_sharded(
     let mut tensors_processed: usize = 0;
 
     for shard_filename in &shard_filenames {
-        // Validate shard filename doesn't escape the base directory
-        if shard_filename.contains("..") || Path::new(shard_filename).is_absolute() {
+        // Validate shard filename to prevent path traversal via crafted index.json.
+        let shard_path_component = Path::new(shard_filename);
+        if shard_path_component.is_absolute()
+            || shard_path_component
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
             return Err(SurgeryError::ShardingError(format!(
-                "shard filename '{}' contains path traversal or is absolute",
-                shard_filename
+                "shard filename '{shard_filename}' contains path traversal"
             )));
         }
+
         let shard_path = base_dir.join(shard_filename);
         let shard = MappedSafetensors::open(&shard_path)?;
         shard.advise_sequential();
@@ -676,13 +639,7 @@ pub(crate) fn merge_sharded(
             tensors_processed += 1;
         }
 
-        let file = writer.into_inner().map_err(|e| {
-            SurgeryError::Io(std::io::Error::other(format!(
-                "failed to flush output buffer: {}",
-                e.error()
-            )))
-        })?;
-        file.sync_all()?;
+        writer.flush()?;
         shard.advise_dontneed();
     }
 
@@ -1017,10 +974,10 @@ mod tests {
 
     #[test]
     fn dtype_byte_size_all_supported() {
-        assert_eq!(dtype_byte_size(Dtype::F16).unwrap(), 2);
-        assert_eq!(dtype_byte_size(Dtype::BF16).unwrap(), 2);
-        assert_eq!(dtype_byte_size(Dtype::F32).unwrap(), 4);
-        assert!(dtype_byte_size(Dtype::I32).is_err());
+        assert_eq!(dtype_byte_size(Dtype::F16, "test").unwrap(), 2);
+        assert_eq!(dtype_byte_size(Dtype::BF16, "test").unwrap(), 2);
+        assert_eq!(dtype_byte_size(Dtype::F32, "test").unwrap(), 4);
+        assert!(dtype_byte_size(Dtype::I32, "test").is_err());
     }
 
     #[test]

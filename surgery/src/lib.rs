@@ -69,25 +69,23 @@ pub struct DryRunInfo {
     pub estimated_output_bytes: u64,
     pub is_sharded: bool,
     pub shard_count: usize,
-    /// LoRA rank from adapter config.
-    pub rank: u32,
-    /// LoRA alpha from adapter config.
-    pub alpha: f32,
-    /// Scaling coefficient (alpha / r).
-    pub scaling: f32,
-    /// Target module names from adapter config.
-    pub target_modules: Vec<String>,
-    /// Whether Conv1D-style transposition is enabled.
-    pub fan_in_fan_out: bool,
-    /// Bias handling mode as a display string.
-    pub bias_mode: String,
 }
 
 /// Inspects a base model and adapter without writing output.
+#[must_use = "dry run info should be used or displayed"]
 pub fn dry_run_info(base_model_path: &Path, adapter_path: &Path) -> Result<DryRunInfo> {
     let adapter_config_path = adapter_path.join("adapter_config.json");
     let adapter_config = config::AdapterConfig::from_path(&adapter_config_path)?;
     let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
+    if !adapter_weights_path.exists() {
+        return Err(SurgeryError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "adapter weights not found at '{}'",
+                adapter_weights_path.display()
+            ),
+        )));
+    }
 
     io::compute_dry_run_info(base_model_path, &adapter_weights_path, &adapter_config)
 }
@@ -105,6 +103,9 @@ pub fn dry_run_info(base_model_path: &Path, adapter_path: &Path) -> Result<DryRu
 ///
 /// For single-file models, `output_path` is the output `.safetensors` file.
 /// For sharded models, `output_path` is the output directory (shards + index.json).
+///
+/// `progress` is called with `(current_tensor_index, total_tensor_count)` after
+/// each tensor is processed. Pass `None` to disable progress reporting.
 pub fn merge_adapter(
     base_model_path: &Path,
     adapter_path: &Path,
@@ -116,6 +117,15 @@ pub fn merge_adapter(
     let adapter_config = config::AdapterConfig::from_path(&adapter_config_path)?;
 
     let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
+    if !adapter_weights_path.exists() {
+        return Err(SurgeryError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "adapter weights not found at '{}'",
+                adapter_weights_path.display()
+            ),
+        )));
+    }
 
     match io::resolve_base_model(base_model_path)? {
         io::BaseModelSource::SingleFile(base_file) => io::merge_and_write(

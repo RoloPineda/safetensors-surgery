@@ -24,6 +24,7 @@ fn has_path_segment(name: &str, segment: &str) -> bool {
 
 impl NameMapping {
     /// Returns the (lora_A, lora_B) adapter names for a base tensor, if it is a LoRA target.
+    #[must_use]
     pub fn lora_pair(&self, base_name: &str) -> Option<&(String, String)> {
         self.lora_targets.get(base_name)
     }
@@ -35,11 +36,13 @@ impl NameMapping {
     }
 
     /// Returns the adapter tensor name if this base tensor should be fully replaced.
+    #[must_use]
     pub fn replacement(&self, base_name: &str) -> Option<&str> {
         self.replacements.get(base_name).map(|s| s.as_str())
     }
 
     /// Returns the adapter bias tensor name for a base bias tensor.
+    #[must_use]
     pub fn bias_source(&self, base_name: &str) -> Option<&str> {
         self.biases.get(base_name).map(|s| s.as_str())
     }
@@ -94,12 +97,25 @@ pub fn build_name_mapping(
     for (base_name, a_name) in &lora_a_map {
         if let Some(b_name) = lora_b_map.get(base_name) {
             lora_targets.insert(base_name.clone(), (a_name.clone(), b_name.clone()));
+        } else {
+            eprintln!(
+                "warning: adapter has lora_A for '{base_name}' but no matching lora_B (skipped)"
+            );
+        }
+    }
+    for base_name in lora_b_map.keys() {
+        if !lora_a_map.contains_key(base_name) {
+            eprintln!(
+                "warning: adapter has lora_B for '{base_name}' but no matching lora_A (skipped)"
+            );
         }
     }
 
     // Only error if NO target modules have matching adapter tensors.
-    // Individual modules without matches are silently skipped — this supports
+    // Individual modules without matches are silently skipped to support
     // adapters trained on a subset of layers.
+    // Use exact dot-delimited segment matching (not substring) to prevent
+    // "proj" from falsely matching "q_proj", "v_proj", etc.
     let matched_any = target_modules.iter().any(|module| {
         lora_targets
             .keys()
