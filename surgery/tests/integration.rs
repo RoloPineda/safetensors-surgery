@@ -180,7 +180,8 @@ fn merge_two_4x4_lora_targets() {
     }"#;
     fs::write(adapter_dir.join("adapter_config.json"), config).unwrap();
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 2);
     assert_eq!(stats.tensors_copied, 0);
@@ -371,7 +372,8 @@ fn merge_with_passthrough_tensors() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_copied, 1);
     assert_eq!(stats.tensors_merged, 1);
@@ -461,7 +463,8 @@ fn merge_with_bias_lora_only() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 1);
     assert_eq!(stats.biases_merged, 1);
@@ -540,7 +543,8 @@ fn merge_with_modules_to_save() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 1);
     assert_eq!(stats.tensors_replaced, 1);
@@ -614,7 +618,8 @@ fn merge_bf16_preserves_dtype() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
     assert_eq!(stats.tensors_merged, 1);
 
     // Verify output dtype is BF16
@@ -686,7 +691,8 @@ fn merge_f16_preserves_dtype() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
     assert_eq!(stats.tensors_merged, 1);
 
     let (_, dtype, _) = read_tensor_info(&output_path, "model.layers.0.self_attn.q_proj.weight");
@@ -760,7 +766,8 @@ fn merge_with_fan_in_fan_out() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
     assert_eq!(stats.tensors_merged, 1);
 
     let values = read_f32_tensor(&output_path, "model.layers.0.self_attn.q_proj.weight");
@@ -917,7 +924,14 @@ fn merge_with_progress_callback() {
         call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     };
 
-    surgery::merge_adapter(&base_path, &adapter_dir, &output_path, Some(&progress)).unwrap();
+    surgery::merge_adapter(
+        &base_path,
+        &adapter_dir,
+        &output_path,
+        false,
+        Some(&progress),
+    )
+    .unwrap();
 
     // Progress fires once per tensor (2) + once for the final call = 3
     let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
@@ -998,7 +1012,7 @@ fn merge_sharded_model() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_dir, &adapter_dir, &output_dir, None).unwrap();
+    let stats = surgery::merge_adapter(&base_dir, &adapter_dir, &output_dir, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 1);
     assert_eq!(stats.tensors_copied, 1);
@@ -1073,7 +1087,7 @@ fn merge_errors_on_missing_adapter_config() {
         ],
     );
 
-    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None);
+    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None);
     assert!(result.is_err());
 }
 
@@ -1127,7 +1141,7 @@ fn merge_errors_when_no_targets_match() {
         }"#,
     );
 
-    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None);
+    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(

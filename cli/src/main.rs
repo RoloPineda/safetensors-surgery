@@ -24,6 +24,10 @@ struct Args {
     /// Print what would be done without writing output.
     #[arg(long, default_value_t = false)]
     dry_run: bool,
+
+    /// Use tiled merge to reduce peak memory at the cost of speed.
+    #[arg(long, default_value_t = false)]
+    low_memory: bool,
 }
 
 fn main() -> Result<()> {
@@ -80,6 +84,7 @@ fn main() -> Result<()> {
         &args.base_model,
         &args.adapter,
         &args.output,
+        args.low_memory,
         Some(&progress_callback),
     )
     .context("merge failed")?;

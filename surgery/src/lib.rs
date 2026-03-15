@@ -4,6 +4,7 @@ pub mod config;
 pub mod io;
 pub mod merge;
 pub mod names;
+extern crate blas_src;
 
 use std::path::Path;
 
@@ -81,7 +82,9 @@ pub fn dry_run_info(base_model_path: &Path, adapter_path: &Path) -> Result<DryRu
 
 /// Merges a LoRA adapter into a base model, writing the result to the output path.
 ///
-/// Memory usage is bounded by one tensor at a time regardless of model size.
+/// When `low_memory` is true, the merge uses tiled computation to reduce peak
+/// memory at the cost of speed. When false, the full delta matrix is materialized
+/// for faster merging.
 ///
 /// `base_model_path` can be:
 /// - A `.safetensors` file (single-file model)
@@ -94,6 +97,7 @@ pub fn merge_adapter(
     base_model_path: &Path,
     adapter_path: &Path,
     output_path: &Path,
+    low_memory: bool,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MergeStats> {
     let adapter_config_path = adapter_path.join("adapter_config.json");
@@ -107,6 +111,7 @@ pub fn merge_adapter(
             &adapter_weights_path,
             &adapter_config,
             output_path,
+            low_memory,
             progress,
         ),
         io::BaseModelSource::Sharded { dir, index } => io::merge_sharded(
@@ -115,6 +120,7 @@ pub fn merge_adapter(
             &adapter_weights_path,
             &adapter_config,
             output_path,
+            low_memory,
             progress,
         ),
     }
