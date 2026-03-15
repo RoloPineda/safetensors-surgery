@@ -83,7 +83,10 @@ Two merge paths are available. The default path materializes the full delta matr
 
 ![Merge time](docs/benchmark_time.png)
 
+Note: PEFT caused OOM error during the Llama3-70B run and hence the numbers show as 0 for memory and time. 
+
 Benchmarked on an AMD Ryzen 9 9950X3D, 128GB DDR5, 1TB NVMe. Median of 3 runs. Full methodology and reproduction instructions in [`benchmarks/`](benchmarks/).
+
 
 | Model | Tool | Peak RSS | Time | Accuracy | Passthrough |
 |:---|:---|---:|---:|:---:|:---:|
