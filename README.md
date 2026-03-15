@@ -3,19 +3,18 @@
 [![CI](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml/badge.svg)](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yaml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 
-`safetensors-surgery` merges PEFT LoRA adapters into safetensors base models using memory-mapped I/O. It processes tensors one at a time, so a 14B model merges in under 20 seconds using 4GB of RAM. The standard Python workflow needs 57GB for the same operation.
-
+`safetensors-surgery` merges PEFT LoRA adapters into safetensors base models using memory-mapped I/O.
 ## Why this tool
 
-Merging a LoRA adapter into a base model with PEFT's `merge_and_unload` requires loading the entire model into memory. For Mistral-7B that's 28GB of RAM. For a 14B model it's 57GB. mergekit needs less (14GB for Mistral-7B) but still scales linearly with model size. If you train on a rented GPU and want to merge on your laptop, you're stuck. You either keep the GPU running (paying by the hour), merge in the cloud, or serve with the adapter applied at runtime (slower inference).
+Merging a LoRA adapter into a base model with PEFT's `merge_and_unload` requires loading the entire model into memory. For Mistral-7B that's 28GB of RAM. For Llama3-70B it's well over 100GB. mergekit needs less (13GB for Llama3-70B) but still scales linearly with model size. If you train on a rented GPU and want to merge on your laptop, you're stuck. You either keep the GPU running, merge in the cloud, or serve with the adapter applied at runtime (slower inference).
 
-`safetensors-surgery` solves this by memory-mapping the base model and processing one tensor at a time. Mistral-7B merges in 10GB. A 14B model merges in 4GB (if sharded). No Python, no PyTorch, runs on any machine, finishes in seconds.
+`safetensors-surgery` solves this by memory-mapping the base model and processing one tensor at a time. Llama3-70B merges in 6.4GB with `--low-memory`.
 
 ### Tradeoffs
 
-**What you get:** 2-13x less memory than PEFT, mathematically equivalent merge results, 100% bit-identical passthrough on non-LoRA tensors, no Python or PyTorch dependency at runtime.
+**Advantages:** 2x less memory than mergekit on 70B models, f64-accurate merge results (100% of elements within 1 ULP of the f64 reference), 100% bit-identical passthrough on non-LoRA tensors, no Python or PyTorch dependency at runtime.
 
-**What you give up:** On 7B+ models, surgery can be slower on wall-clock time than mergekit and PEFT. The output always preserves the base model's dtype (no built-in conversion to a different precision). Only PEFT-format LoRA adapters are supported (no MLX, no multi-adapter merge methods like TIES/DARE/SLERP).
+**Downsides:** On very large models (70B+), surgery is slower on wall-clock time than mergekit due to f64 matmul overhead on large projection matrices.
 
 ## Contents
 
@@ -39,12 +38,6 @@ cd safetensors-surgery
 cargo install --path cli
 ```
 
-### Python
-
-```sh
-pip install safetensors-surgery
-```
-
 ## Usage
 
 ### CLI
@@ -62,6 +55,13 @@ safetensors-surgery merge \
   --adapter ./my-lora-adapter \
   --output ./merged-model
 
+# Low-memory mode (tiled merge, uses less RAM at the cost of speed)
+safetensors-surgery merge \
+  --base-model ./Llama-3-70B \
+  --adapter ./my-lora-adapter \
+  --output ./merged-model \
+  --low-memory
+
 # Preview what will happen without writing anything
 safetensors-surgery merge \
   --base-model ./Mistral-7B-v0.1 \
@@ -70,26 +70,12 @@ safetensors-surgery merge \
   --dry-run
 ```
 
-### Python
-
-```python
-import safetensors_surgery
-
-# Merge
-safetensors_surgery.merge(
-    base_path="./Mistral-7B-v0.1",
-    lora_path="./my-lora-adapter",
-    output_path="./merged-model.safetensors",
-)
-
-# Inspect without merging
-info = safetensors_surgery.inspect("./Mistral-7B-v0.1", "./my-lora-adapter")
-print(info)
-```
 
 ## How It Works
 
-The base model is memory-mapped, allowing the OS to stream weights from disk rather than forcing the entire model into standard heap allocation at once. For each LoRA target tensor, the base weight, lora_A, and lora_B are read, the merge `base + (alpha / r) * (B @ A)` is computed in f64, the result is downcast to the output dtype in a single step, and the buffer is freed before moving to the next tensor. Non-LoRA tensors are byte-copied from the mmap to the output without allocation or conversion. For sharded models, each shard is opened and closed independently.
+The base model is memory-mapped, allowing the OS to stream weights from disk rather than loading the entire model into memory. For each LoRA target tensor, the base weight, lora_A, and lora_B are read, the merge `base + (alpha / r) * (B @ A)` is computed with f64 matmul accumulation, and the final base+delta addition is performed in f64 before downcasting to the output dtype. This preserves numerical accuracy that would be lost with f32 intermediate computation. Non-LoRA tensors are byte-copied from the mmap to the output without allocation or conversion. For sharded models, each shard is opened and closed independently.
+
+Two merge paths are available. The default path materializes the full delta matrix in f64 for maximum speed. The `--low-memory` path tiles the matmul in fixed-size chunks, bounding peak memory at the cost of slower speed due to per-tile allocation overhead.
 
 ## Performance
 
@@ -110,10 +96,13 @@ Benchmarked on an AMD Ryzen 9 9950X3D, 128GB DDR5, 1TB NVMe. Median of 3 runs. F
 | **Mistral-7B** (bf16) | surgery | **9,856 MB** | 12.97s | Equivalent | 100% |
 | | PEFT | 28,493 MB | 11.98s | Equivalent | 100% |
 | | mergekit | 14,668 MB | **8.56s** | Equivalent | 100% |
+| **Llama3-70B** (bf16) | surgery | 11,779 MB | 365.77s | Equivalent | 100% |
+| | surgery --low-memory | **6,403 MB** | 640.36s | Equivalent | 100% |
+| | mergekit | 13,083 MB | **180.57s** | Divergent | 100% |
 
 **Peak RSS:** Maximum resident set size. Lower is better.
 
-**Accuracy:** All tools produce outputs that are mathematically equivalent in the output dtype. Intermediate computation differences between implementations (different GEMM accumulation order, different precision paths) are bounded below the output dtype's machine epsilon and vanish upon downcast.
+**Accuracy:** Measured using per-element ULP (unit in the last place) distance against a Python f64 reference merge. "Equivalent" means 100% of LoRA-merged elements are within 1 ULP of the f64 reference. "Divergent" means some elements exceed the output dtype's representable precision boundary.
 
 **Passthrough:** Percentage of non-LoRA tensors bit-identical to the original base model.
 
@@ -139,11 +128,11 @@ These fields are read from `adapter_config.json`:
 | `bias` | No | `"none"` (default), `"lora_only"`, or `"all"` |
 | `modules_to_save` | No | Full modules replaced entirely, not low-rank merged |
 
-## Current Known Limitations
+## Current Limitations
 
 **Quantized base models not supported.** The base model must be unquantized fp16, bf16, or fp32 safetensors. GPTQ, AWQ, and bitsandbytes 4-bit models cannot be used.
 
-**Speed on large models.** On 7B+ models, surgery can be slower than mergekit and PEFT due to f64 matmul on large projection matrices. For models under 2B, surgery is consistently the fastest tool.
+**Speed on very large models.** Surgery is faster or competitive through 7B. At 70B scale, f64 matmul on large projection matrices makes surgery slower than mergekit on wall-clock time. The --low-memory flag trades more time for less memory, which is useful when RAM is the constraint rather than speed.
 
 **No output dtype conversion.** The output always matches the base model's dtype. Converting a bf16 merge to fp16 requires a separate tool.
 
@@ -160,6 +149,12 @@ See [`benchmarks/`](benchmarks/) for reproduction instructions. Download test mo
 ```sh
 uv run benchmarks/download_data.py --models all
 uv run benchmarks/compare.py --models opt-350m tinyllama-1.1b mistral-7b --runs 3
+```
+
+To benchmark the low-memory mode alongside the default:
+
+```sh
+uv run benchmarks/compare.py --models mistral-7b --tools surgery surgery_low_mem mergekit --runs 3
 ```
 
 Hardware varies. If you run benchmarks on your machine, consider sharing the results (CPU model, RAM, storage type, and the `benchmarks/results.json` file) so the community can see performance across different setups.
