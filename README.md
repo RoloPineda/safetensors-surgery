@@ -1,7 +1,8 @@
 # safetensors-surgery
 
-[![CI](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml/badge.svg)](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yaml)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![CI](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml/badge.svg)](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml)
+[![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
+
 
 `safetensors-surgery` merges PEFT LoRA adapters into safetensors base models using memory-mapped I/O.
 ## Why this tool
@@ -164,4 +165,4 @@ Hardware varies. If you run benchmarks on your machine, consider sharing the res
 
 ## License
 
-MIT
+Mozilla Public License 2.0 (MPL-2.0). See [`LICENSE`](LICENSE).
