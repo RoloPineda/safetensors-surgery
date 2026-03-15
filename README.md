@@ -1,6 +1,6 @@
 # safetensors-surgery
 
-[![CI](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml/badge.svg)](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yaml)
+[![CI](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml/badge.svg)](https://github.com/RoloPineda/safetensors-surgery/actions/workflows/ci.yml)
 [![License: MPL 2.0](https://img.shields.io/badge/License-MPL%202.0-brightgreen.svg)](LICENSE)
 
 
