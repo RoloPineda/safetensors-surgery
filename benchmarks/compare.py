@@ -121,9 +121,18 @@ def parse_gnu_time_stderr(stderr):
         r"Elapsed \(wall clock\) time \(h:mm:ss or m:ss\): ([\d:.]+)", stderr
     )
 
-    peak_rss_mb = int(rss_match.group(1)) / 1024 if rss_match else 0.0
     if not rss_match:
-        print("  Warning: could not parse peak RSS from /usr/bin/time output", file=sys.stderr)
+        print(
+            "  Warning: could not parse RSS from /usr/bin/time output",
+            file=sys.stderr,
+        )
+    if not wall_match:
+        print(
+            "  Warning: could not parse wall time from /usr/bin/time output",
+            file=sys.stderr,
+        )
+
+    peak_rss_mb = int(rss_match.group(1)) / 1024 if rss_match else 0.0
 
     wall_seconds = 0.0
     if wall_match:
@@ -136,8 +145,6 @@ def parse_gnu_time_stderr(stderr):
             )
         else:
             wall_seconds = float(parts[0])
-    else:
-        print("  Warning: could not parse wall time from /usr/bin/time output", file=sys.stderr)
 
     return peak_rss_mb, wall_seconds
 
@@ -205,31 +212,28 @@ def measure_peft_subprocess(base_dir, adapter_path, output_path, low_memory=Fals
         Dict with peak_rss_mb and wall_seconds.
     """
     low_mem_flag = "1" if low_memory else "0"
-    script = textwrap.dedent("""\
-        import sys
+    script = textwrap.dedent(f"""\
         import torch
         from peft import PeftModel
         from transformers import AutoModelForCausalLM
 
-        base_dir, adapter_path, output_path, low_mem_flag = sys.argv[1:5]
-        low_memory = low_mem_flag == "1"
+        low_memory = {low_mem_flag} == "1"
 
-        load_kwargs = {"torch_dtype": "auto"}
+        load_kwargs = {{"torch_dtype": "auto"}}
         if low_memory:
             load_kwargs["low_cpu_mem_usage"] = True
 
         model = AutoModelForCausalLM.from_pretrained(
-            base_dir, **load_kwargs
+            "{base_dir}", **load_kwargs
         )
-        peft_model = PeftModel.from_pretrained(model, adapter_path)
+        peft_model = PeftModel.from_pretrained(model, "{adapter_path}")
         merged = peft_model.merge_and_unload()
-        merged.save_pretrained(output_path)
+        merged.save_pretrained("{output_path}")
     """)
 
     cmd = [
         "/usr/bin/time", "-v",
         sys.executable, "-c", script,
-        str(base_dir), str(adapter_path), str(output_path), low_mem_flag,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -248,12 +252,10 @@ def write_mergekit_config(base_dir, adapter_path, output_yaml_path):
         adapter_path: Path to the adapter directory.
         output_yaml_path: Where to write the YAML config.
     """
-    # passthrough with a lora: field applies the LoRA adapter to the base model
-    # without blending multiple models — this is mergekit's single-adapter merge mode
     config = textwrap.dedent(f"""\
         models:
-          - model: "{base_dir}"
-            lora: "{adapter_path}"
+          - model: {base_dir}
+            lora: {adapter_path}
             parameters:
               weight: 1.0
         merge_method: passthrough
@@ -382,10 +384,6 @@ def chunked_ulp_stats(a, b, chunk_size=1 << 20):
         a_uint = a_flat[start:end].view(int_dtype).to(work_dtype) & unsign_mask
         b_uint = b_flat[start:end].view(int_dtype).to(work_dtype) & unsign_mask
 
-        # Map sign-magnitude IEEE floats to ordered integers:
-        # positive floats map to themselves (already ordered),
-        # negative floats map to (sign_bit - value) to reverse their order
-        # and place them below positive floats in the integer number line.
         a_ord = torch.where(a_uint < sign_bit, a_uint, sign_bit - a_uint)
         b_ord = torch.where(b_uint < sign_bit, b_uint, sign_bit - b_uint)
 
@@ -621,7 +619,6 @@ def measure_all_accuracies(tool_paths, base_dir, adapter_dir):
         ).to(torch.float64)
 
         a_view = lora_a.t() if fan_in_fan_out else lora_a
-        # Process in 512-row chunks to limit peak memory to ~512 * in_features * 8 bytes
         chunk_rows = 512
         for start in range(0, ref_t.shape[0], chunk_rows):
             end = min(start + chunk_rows, ref_t.shape[0])
@@ -870,7 +867,7 @@ def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3,
                     if tool not in acc_results:
                         continue
                     acc = acc_results[tool]
-                    label = tool_labels.get(tool, tool)
+                    tool_label = tool_labels.get(tool, tool)
                     pct = (
                         100.0 * acc["non_lora_identical"] / acc["non_lora_total"]
                         if acc["non_lora_total"] > 0
@@ -882,7 +879,7 @@ def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3,
                         else 0.0
                     )
                     print(
-                        f"    {label}:"
+                        f"    {tool_label}:"
                         f"  max_ulp={acc['max_ulp']}"
                         f"  mean_ulp={acc['mean_ulp']:.6f}"
                         f"  within_1_ulp={acc['within_1_ulp_pct']:.4f}%"
@@ -935,7 +932,7 @@ def print_summary(results, tools):
 
     for r in results:
         first_tool = True
-        surgery_stats = r.get("surgery")
+        surgery_stats = r.get("surgery") or r.get("surgery_low_mem")
 
         for tool in tools:
             stats = r.get(tool)
@@ -1201,17 +1198,8 @@ def save_chart(results, tools, output_path):
                 entry[f"{prefix}_wall_seconds"] = None
         export.append(entry)
 
-    tmp_fd, tmp_path = tempfile.mkstemp(
-        dir=os.path.dirname(results_json) or ".",
-        suffix=".tmp",
-    )
-    try:
-        with os.fdopen(tmp_fd, "w") as f:
-            json.dump(export, f, indent=2)
-        os.replace(tmp_path, results_json)
-    except:
-        os.unlink(tmp_path)
-        raise
+    with open(results_json, "w") as f:
+        json.dump(export, f, indent=2)
     print(f"Raw data saved to {results_json}")
 
 
@@ -1232,19 +1220,15 @@ def check_tool_available(tool):
             return False
 
     if tool in ("peft", "peft_low_mem"):
-        try:
-            import peft  # noqa: F401
-            import transformers  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        import importlib.util
+        return (
+            importlib.util.find_spec("peft") is not None
+            and importlib.util.find_spec("transformers") is not None
+        )
 
     if tool == "mergekit":
-        try:
-            import mergekit  # noqa: F401
-            return True
-        except ImportError:
-            return False
+        import importlib.util
+        return importlib.util.find_spec("mergekit") is not None
 
     return False
 
@@ -1351,9 +1335,9 @@ def main():
 
     print_summary(results, tools)
 
-    dirname = os.path.dirname(args.output)
-    if dirname:
-        os.makedirs(dirname, exist_ok=True)
+    output_dirname = os.path.dirname(args.output)
+    if output_dirname:
+        os.makedirs(output_dirname, exist_ok=True)
     save_chart(results, tools, args.output)
 
 
