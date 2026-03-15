@@ -22,11 +22,11 @@ struct Args {
     output: PathBuf,
 
     /// Print what would be done without writing output.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     dry_run: bool,
 
     /// Use tiled merge to reduce peak memory at the cost of speed.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     low_memory: bool,
 }
 
@@ -34,19 +34,16 @@ fn main() -> Result<()> {
     let args = Args::parse();
 
     if args.dry_run {
-        let config_path = args.adapter.join("adapter_config.json");
-        let config = safetensors_surgery::config::AdapterConfig::from_path(&config_path)
-            .context("failed to read adapter config")?;
-        println!("Adapter config:");
-        println!("  rank: {}", config.rank());
-        println!("  alpha: {}", config.alpha());
-        println!("  scaling: {}", config.scaling());
-        println!("  target_modules: {:?}", config.target_modules());
-        println!("  fan_in_fan_out: {}", config.fan_in_fan_out());
-        println!("  bias: {:?}", config.bias());
-
         let info = safetensors_surgery::dry_run_info(&args.base_model, &args.adapter)
             .context("failed to inspect model")?;
+        println!("Adapter config:");
+        println!("  rank: {}", info.rank);
+        println!("  alpha: {}", info.alpha);
+        println!("  scaling: {}", info.scaling);
+        println!("  target_modules: {:?}", info.target_modules);
+        println!("  fan_in_fan_out: {}", info.fan_in_fan_out);
+        println!("  bias: {}", info.bias_mode);
+
         println!("\nBase model:");
         if info.is_sharded {
             println!("  type: sharded ({} shards)", info.shard_count);

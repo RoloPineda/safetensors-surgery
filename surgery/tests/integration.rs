@@ -730,11 +730,13 @@ fn merge_with_fan_in_fan_out() {
     );
 
     // With fan_in_fan_out=true:
-    // lora_A shape [2, 1]: [[1], [2]]  -> A^T = [[1, 2]]
-    // lora_B shape [2, 1]: [[3], [4]]
-    // B @ A^T = [[3],[4]] @ [[1,2]] = [[3,6],[4,8]]
+    // Base shape [2, 2] stored as [in_features, out_features]
+    // lora_A shape [r, in_features] = [1, 2]: [[1, 2]]
+    // lora_B shape [out_features, r] = [2, 1]: [[3], [4]]
+    // B @ A = [[3],[4]] @ [[1,2]] = [[3,6],[4,8]]
+    // delta = (B @ A)^T = [[3,4],[6,8]]
     // scaling = alpha/r = 1/1 = 1.0
-    // merged = [[1,0],[0,1]] + 1.0 * [[3,6],[4,8]] = [[4,6],[4,9]]
+    // merged = [[1,0],[0,1]] + 1.0 * [[3,4],[6,8]] = [[4,4],[6,9]]
     let lora_a: [f32; 2] = [1.0, 2.0];
     let lora_b: [f32; 2] = [3.0, 4.0];
 
@@ -744,7 +746,7 @@ fn merge_with_fan_in_fan_out() {
             (
                 "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
                 &lora_a,
-                vec![2, 1],
+                vec![1, 2],
             ),
             (
                 "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
@@ -772,7 +774,7 @@ fn merge_with_fan_in_fan_out() {
 
     let values = read_f32_tensor(&output_path, "model.layers.0.self_attn.q_proj.weight");
     #[rustfmt::skip]
-    let expected: [f32; 4] = [4.0, 6.0, 4.0, 9.0];
+    let expected: [f32; 4] = [4.0, 4.0, 6.0, 9.0];
     for (i, (got, want)) in values.iter().zip(expected.iter()).enumerate() {
         assert!(
             (got - want).abs() < 1e-6,

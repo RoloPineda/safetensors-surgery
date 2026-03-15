@@ -69,6 +69,18 @@ pub struct DryRunInfo {
     pub estimated_output_bytes: u64,
     pub is_sharded: bool,
     pub shard_count: usize,
+    /// LoRA rank from adapter config.
+    pub rank: u32,
+    /// LoRA alpha from adapter config.
+    pub alpha: f32,
+    /// Scaling coefficient (alpha / r).
+    pub scaling: f32,
+    /// Target module names from adapter config.
+    pub target_modules: Vec<String>,
+    /// Whether Conv1D-style transposition is enabled.
+    pub fan_in_fan_out: bool,
+    /// Bias handling mode as a display string.
+    pub bias_mode: String,
 }
 
 /// Inspects a base model and adapter without writing output.

@@ -103,7 +103,7 @@ pub fn build_name_mapping(
     let matched_any = target_modules.iter().any(|module| {
         lora_targets
             .keys()
-            .any(|base_name| base_name.contains(module.as_str()))
+            .any(|base_name| has_path_segment(base_name, module.as_str()))
     });
     if !target_modules.is_empty() && !matched_any {
         return Err(SurgeryError::MissingAdapterTensor {

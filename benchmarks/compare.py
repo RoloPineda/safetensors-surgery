@@ -50,9 +50,14 @@ PRESET_MODELS = {
         "adapter": "benchmarks/data/mistral-7b/adapter",
         "label": "Mistral-7B (14GB)",
     },
+    "llama3-70b": {
+        "base": "benchmarks/data/llama3-70b/base",
+        "adapter": "benchmarks/data/llama3-70b/adapter",
+        "label": "Llama3-70B (124GB)",
+    }
 }
 
-TOOLS = ["surgery", "peft", "peft_low_mem", "mergekit"]
+TOOLS = ["surgery", "surgery_low_mem", "peft", "peft_low_mem", "mergekit"]
 
 
 def find_project_root():
@@ -117,6 +122,8 @@ def parse_gnu_time_stderr(stderr):
     )
 
     peak_rss_mb = int(rss_match.group(1)) / 1024 if rss_match else 0.0
+    if not rss_match:
+        print("  Warning: could not parse peak RSS from /usr/bin/time output", file=sys.stderr)
 
     wall_seconds = 0.0
     if wall_match:
@@ -129,6 +136,8 @@ def parse_gnu_time_stderr(stderr):
             )
         else:
             wall_seconds = float(parts[0])
+    else:
+        print("  Warning: could not parse wall time from /usr/bin/time output", file=sys.stderr)
 
     return peak_rss_mb, wall_seconds
 
@@ -149,13 +158,14 @@ def drop_caches():
         print(f"  Warning: could not drop caches: {e}", file=sys.stderr)
 
 
-def measure_surgery(base_path, adapter_path, output_path):
+def measure_surgery(base_path, adapter_path, output_path, low_memory=False):
     """Runs the Rust CLI under /usr/bin/time and returns (peak_rss_mb, wall_seconds).
 
     Args:
         base_path: Path to the base model safetensors file or directory.
         adapter_path: Path to the adapter directory.
         output_path: Path for the merged output file.
+        low_memory: If True, passes --low-memory to the CLI.
 
     Returns:
         Dict with peak_rss_mb and wall_seconds.
@@ -168,6 +178,8 @@ def measure_surgery(base_path, adapter_path, output_path):
         "--adapter", adapter_path,
         "--output", output_path,
     ]
+    if low_memory:
+        cmd.append("--low-memory")
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
         print(f"  CLI stderr:\n{result.stderr}", file=sys.stderr)
@@ -193,28 +205,31 @@ def measure_peft_subprocess(base_dir, adapter_path, output_path, low_memory=Fals
         Dict with peak_rss_mb and wall_seconds.
     """
     low_mem_flag = "1" if low_memory else "0"
-    script = textwrap.dedent(f"""\
+    script = textwrap.dedent("""\
+        import sys
         import torch
         from peft import PeftModel
         from transformers import AutoModelForCausalLM
 
-        low_memory = {low_mem_flag} == "1"
+        base_dir, adapter_path, output_path, low_mem_flag = sys.argv[1:5]
+        low_memory = low_mem_flag == "1"
 
-        load_kwargs = {{"torch_dtype": "auto"}}
+        load_kwargs = {"torch_dtype": "auto"}
         if low_memory:
             load_kwargs["low_cpu_mem_usage"] = True
 
         model = AutoModelForCausalLM.from_pretrained(
-            "{base_dir}", **load_kwargs
+            base_dir, **load_kwargs
         )
-        peft_model = PeftModel.from_pretrained(model, "{adapter_path}")
+        peft_model = PeftModel.from_pretrained(model, adapter_path)
         merged = peft_model.merge_and_unload()
-        merged.save_pretrained("{output_path}")
+        merged.save_pretrained(output_path)
     """)
 
     cmd = [
         "/usr/bin/time", "-v",
         sys.executable, "-c", script,
+        str(base_dir), str(adapter_path), str(output_path), low_mem_flag,
     ]
     result = subprocess.run(cmd, capture_output=True, text=True)
     if result.returncode != 0:
@@ -233,10 +248,12 @@ def write_mergekit_config(base_dir, adapter_path, output_yaml_path):
         adapter_path: Path to the adapter directory.
         output_yaml_path: Where to write the YAML config.
     """
+    # passthrough with a lora: field applies the LoRA adapter to the base model
+    # without blending multiple models — this is mergekit's single-adapter merge mode
     config = textwrap.dedent(f"""\
         models:
-          - model: {base_dir}
-            lora: {adapter_path}
+          - model: "{base_dir}"
+            lora: "{adapter_path}"
             parameters:
               weight: 1.0
         merge_method: passthrough
@@ -281,40 +298,117 @@ def measure_mergekit_subprocess(base_dir, adapter_path, output_path):
         os.unlink(config_path)
 
 
-def load_tensors_from_path(path):
-    """Loads all tensors from a safetensors file or directory into a dict.
+def chunked_diff_stats(a, b, chunk_size=1 << 20):
+    """Computes max and mean absolute difference without full f32 copies.
+
+    Flattens both tensors and processes them in chunks, casting only one
+    chunk at a time to f32. Peak memory overhead is roughly
+    3 * chunk_size * 4 bytes (two f32 chunks plus the diff).
 
     Args:
-        path: A safetensors file or directory containing safetensors files.
+        a: First tensor.
+        b: Second tensor (same shape and dtype as a).
+        chunk_size: Number of elements per chunk.
 
     Returns:
-        Dict mapping tensor name to (bytes, dtype_str, shape) tuples.
-        Tensors are keyed by name and stored as raw bytes to avoid
-        requiring torch as a dependency in the benchmark harness.
+        Tuple of (max_diff, mean_diff) as Python floats.
     """
-    from safetensors import safe_open
+    a_flat = a.reshape(-1)
+    b_flat = b.reshape(-1)
+    numel = a_flat.numel()
+    max_diff = 0.0
+    total = 0.0
+    for start in range(0, numel, chunk_size):
+        end = min(start + chunk_size, numel)
+        d = (a_flat[start:end].float() - b_flat[start:end].float()).abs()
+        chunk_max = d.max().item()
+        if chunk_max > max_diff:
+            max_diff = chunk_max
+        total += d.sum().item()
+        del d
+    mean_diff = total / numel if numel > 0 else 0.0
+    return max_diff, mean_diff
 
-    path = Path(path)
-    if path.is_file():
-        files = [path]
+
+def chunked_ulp_stats(a, b, chunk_size=1 << 20):
+    """Computes ULP distance between two tensors of the same dtype.
+
+    Uses the sign-magnitude to ordered-integer trick: IEEE floats have
+    the property that adjacent float values have adjacent integer
+    representations when mapped to a linear integer space. This gives
+    exact ULP distance without any float upcasting.
+
+    Supports bf16, f16, and f32. Processes in chunks to bound memory.
+
+    Args:
+        a: First tensor.
+        b: Second tensor (same shape and dtype as a).
+        chunk_size: Number of elements per chunk.
+
+    Returns:
+        Tuple of (max_ulp, mean_ulp, within_1_ulp, total) where
+        max_ulp is the worst-case ULP distance, mean_ulp is the average,
+        within_1_ulp is the count of elements with ULP distance <= 1,
+        and total is the number of elements compared.
+    """
+    import torch
+
+    dt = a.dtype
+    if dt in (torch.bfloat16, torch.float16):
+        int_dtype = torch.int16
+        sign_bit = 0x8000
+        unsign_mask = 0xFFFF
+        work_dtype = torch.int32
+    elif dt == torch.float32:
+        int_dtype = torch.int32
+        sign_bit = 0x80000000
+        unsign_mask = 0xFFFFFFFF
+        work_dtype = torch.int64
     else:
-        files = sorted(path.glob("*.safetensors"))
+        max_d, mean_d = chunked_diff_stats(a, b, chunk_size)
+        return max_d, mean_d, 0, a.numel()
 
-    tensors = {}
-    for f in files:
-        with safe_open(str(f), framework="pt", device="cpu") as sf:
-            for name in sf.keys():
-                tensor = sf.get_tensor(name)
-                tensors[name] = tensor
-    return tensors
+    a_flat = a.reshape(-1)
+    b_flat = b.reshape(-1)
+    numel = a_flat.numel()
+
+    max_ulp = 0
+    total_ulp = 0.0
+    within_1 = 0
+
+    for start in range(0, numel, chunk_size):
+        end = min(start + chunk_size, numel)
+
+        a_uint = a_flat[start:end].view(int_dtype).to(work_dtype) & unsign_mask
+        b_uint = b_flat[start:end].view(int_dtype).to(work_dtype) & unsign_mask
+
+        # Map sign-magnitude IEEE floats to ordered integers:
+        # positive floats map to themselves (already ordered),
+        # negative floats map to (sign_bit - value) to reverse their order
+        # and place them below positive floats in the integer number line.
+        a_ord = torch.where(a_uint < sign_bit, a_uint, sign_bit - a_uint)
+        b_ord = torch.where(b_uint < sign_bit, b_uint, sign_bit - b_uint)
+
+        ulp_dist = (a_ord - b_ord).abs()
+
+        chunk_max = ulp_dist.max().item()
+        if chunk_max > max_ulp:
+            max_ulp = chunk_max
+        total_ulp += ulp_dist.sum().item()
+        within_1 += (ulp_dist <= 1).sum().item()
+
+        del a_uint, b_uint, a_ord, b_ord, ulp_dist
+
+    mean_ulp = total_ulp / numel if numel > 0 else 0.0
+    return int(max_ulp), mean_ulp, int(within_1), numel
 
 
 def verify_outputs(output_paths):
-    """Compares all tool outputs tensor-by-tensor against the first tool.
+    """Compares all tool outputs tensor-by-tensor against surgery as reference.
 
-    Loads each output with safetensors, then checks for missing/extra
-    tensors, shape mismatches, and numerical differences. This is
-    insensitive to tensor ordering within the file.
+    Streams tensors one at a time via lazy safe_open handles to avoid
+    loading full model outputs into memory simultaneously. Computes
+    diff stats per tensor then immediately frees the data.
 
     Args:
         output_paths: Dict mapping tool name to output path (str).
@@ -329,76 +423,124 @@ def verify_outputs(output_paths):
     if len(valid_paths) < 2:
         return
 
-    tools = list(valid_paths.keys())
-    ref_name = tools[0]
-    ref_tensors = load_tensors_from_path(valid_paths[ref_name])
-    all_match = True
+    if "surgery" in valid_paths:
+        ref_name = "surgery"
+    elif "surgery_low_mem" in valid_paths:
+        ref_name = "surgery_low_mem"
+    else:
+        ref_name = list(valid_paths.keys())[0]
 
-    for other_name in tools[1:]:
-        other_tensors = load_tensors_from_path(valid_paths[other_name])
+    other_tools = [t for t in valid_paths if t != ref_name]
+    ref_handles, ref_name_map = open_safetensors_handles(valid_paths[ref_name])
 
-        ref_keys = set(ref_tensors.keys())
-        other_keys = set(other_tensors.keys())
+    try:
+        ref_keys = set(ref_name_map.keys())
 
-        only_ref = ref_keys - other_keys
-        only_other = other_keys - ref_keys
+        for other_name in other_tools:
+            other_handles, other_name_map = open_safetensors_handles(
+                valid_paths[other_name]
+            )
 
-        if only_ref:
-            all_match = False
-            print(f"    Only in {ref_name}: {sorted(only_ref)}")
-        if only_other:
-            all_match = False
-            print(f"    Only in {other_name}: {sorted(only_other)}")
+            try:
+                other_keys = set(other_name_map.keys())
 
-        mismatched = []
-        for tensor_name in sorted(ref_keys & other_keys):
-            t_ref = ref_tensors[tensor_name]
-            t_other = other_tensors[tensor_name]
+                only_ref = ref_keys - other_keys
+                only_other = other_keys - ref_keys
 
-            if t_ref.shape != t_other.shape:
-                all_match = False
-                mismatched.append(
-                    f"      {tensor_name}: shape {list(t_ref.shape)} "
-                    f"vs {list(t_other.shape)}"
-                )
-                continue
+                if only_ref:
+                    print(f"    Only in {ref_name}: {sorted(only_ref)}")
+                if only_other:
+                    print(f"    Only in {other_name}: {sorted(only_other)}")
 
-            if not torch.equal(t_ref, t_other):
-                all_match = False
-                diff = (t_ref.float() - t_other.float()).abs()
-                max_diff = diff.max().item()
-                mean_diff = diff.mean().item()
-                mismatched.append(
-                    f"      {tensor_name}: "
-                    f"max_diff={max_diff:.6e}, mean_diff={mean_diff:.6e}"
-                )
+                mismatched = []
+                for tensor_name in sorted(ref_keys & other_keys):
+                    t_ref = ref_name_map[tensor_name].get_tensor(tensor_name)
+                    t_other = other_name_map[tensor_name].get_tensor(tensor_name)
 
-        if mismatched:
-            print(f"    {ref_name} vs {other_name}: "
-                  f"{len(mismatched)} tensor(s) differ")
-            for line in mismatched:
-                print(line)
-        else:
-            print(f"    {ref_name} vs {other_name}: ALL TENSORS MATCH")
+                    if t_ref.shape != t_other.shape:
+                        mismatched.append(
+                            f"      {tensor_name}: shape {list(t_ref.shape)} "
+                            f"vs {list(t_other.shape)}"
+                        )
+                        del t_ref, t_other
+                        continue
+
+                    if not torch.equal(t_ref, t_other):
+                        max_diff, mean_diff = chunked_diff_stats(
+                            t_ref, t_other
+                        )
+                        del t_ref, t_other
+                        mismatched.append(
+                            f"      {tensor_name}: "
+                            f"max_diff={max_diff:.6e}, "
+                            f"mean_diff={mean_diff:.6e}"
+                        )
+                    else:
+                        del t_ref, t_other
+
+                if mismatched:
+                    print(
+                        f"    {ref_name} vs {other_name}: "
+                        f"{len(mismatched)} tensor(s) differ"
+                    )
+                    for line in mismatched:
+                        print(line)
+                else:
+                    print(
+                        f"    {ref_name} vs {other_name}: ALL TENSORS MATCH"
+                    )
+            finally:
+                del other_name_map, other_handles
+    finally:
+        del ref_name_map, ref_handles
 
 
-def compute_f64_reference(base_dir, adapter_dir):
-    """Computes f64 gold standard merge for LoRA target tensors.
-
-    Loads base weights and LoRA A/B matrices as f64, computes the merge
-    in f64, then downcasts to the base model's original dtype. This is
-    as close to the mathematically correct result as possible.
+def open_safetensors_handles(path):
+    """Opens safetensors file(s) lazily, returning handles and a name-to-handle map.
 
     Args:
+        path: A safetensors file or directory containing safetensors files.
+
+    Returns:
+        Tuple of (handles, name_map) where handles is a list of open
+        safe_open objects (kept alive for the caller to close), and
+        name_map is a dict mapping tensor name to its handle.
+    """
+    from safetensors import safe_open
+
+    path = Path(path)
+    if path.is_file():
+        files = [path]
+    else:
+        files = sorted(path.glob("*.safetensors"))
+
+    handles = []
+    name_map = {}
+    for f in files:
+        h = safe_open(str(f), framework="pt", device="cpu")
+        handles.append(h)
+        for name in h.keys():
+            name_map[name] = h
+    return handles, name_map
+
+
+def measure_all_accuracies(tool_paths, base_dir, adapter_dir):
+    """Measures all tools against a Python f64 reference in a single pass.
+
+    For each LoRA target tensor, computes the f64 reference on the fly,
+    compares every tool's output against it, then immediately discards
+    all large tensors. No full-model-sized dictionary is ever built.
+
+    For non-LoRA tensors, checks byte-identical passthrough per tool.
+
+    Args:
+        tool_paths: Dict mapping tool name to output path.
         base_dir: Path to the base model directory.
         adapter_dir: Path to the adapter directory.
 
     Returns:
-        Tuple of (lora_reference, base_tensors, lora_target_names) where
-        lora_reference maps base tensor names to gold standard tensors
-        in the base model's original dtype,
-        base_tensors maps all base tensor names to their original tensors,
-        and lora_target_names is the set of base names that are LoRA targets.
+        Tuple of (lora_target_count, per_tool_results) where
+        per_tool_results maps tool name to an accuracy metrics dict.
     """
     import torch
 
@@ -412,8 +554,15 @@ def compute_f64_reference(base_dir, adapter_dir):
     fan_in_fan_out = config.get("fan_in_fan_out", False)
 
     base_path = find_safetensors_path(base_dir)
-    base_tensors = load_tensors_from_path(base_path)
-    adapter_tensors = load_tensors_from_path(adapter_dir)
+    base_handles, base_name_map = open_safetensors_handles(base_path)
+    adapter_handles, adapter_name_map = open_safetensors_handles(adapter_dir)
+
+    tool_handle_sets = {}
+    for tool_name, tool_path in tool_paths.items():
+        handles, name_map = open_safetensors_handles(tool_path)
+        tool_handle_sets[tool_name] = (handles, name_map)
+
+    base_name_set = set(base_name_map.keys())
 
     adapter_prefix = "base_model.model."
     lora_a_suffix = ".lora_A.weight"
@@ -422,7 +571,7 @@ def compute_f64_reference(base_dir, adapter_dir):
     lora_a_map = {}
     lora_b_map = {}
 
-    for adapter_name in adapter_tensors:
+    for adapter_name in adapter_name_map:
         if not adapter_name.startswith(adapter_prefix):
             continue
         stripped = adapter_name[len(adapter_prefix):]
@@ -430,119 +579,123 @@ def compute_f64_reference(base_dir, adapter_dir):
         if stripped.endswith(lora_a_suffix):
             base_part = stripped[: -len(lora_a_suffix)]
             base_name = f"{base_part}.weight"
-            if base_name in base_tensors:
+            if base_name in base_name_set:
                 lora_a_map[base_name] = adapter_name
         elif stripped.endswith(lora_b_suffix):
             base_part = stripped[: -len(lora_b_suffix)]
             base_name = f"{base_part}.weight"
-            if base_name in base_tensors:
+            if base_name in base_name_set:
                 lora_b_map[base_name] = adapter_name
 
-    lora_reference = {}
     lora_target_names = set()
+    for name in lora_a_map:
+        if name in lora_b_map:
+            lora_target_names.add(name)
 
-    for base_name in lora_a_map:
-        if base_name not in lora_b_map:
-            continue
-
-        lora_target_names.add(base_name)
-
-        base_w = base_tensors[base_name].to(torch.float64)
-        lora_a = adapter_tensors[lora_a_map[base_name]].to(torch.float64)
-        lora_b = adapter_tensors[lora_b_map[base_name]].to(torch.float64)
-
-        if fan_in_fan_out:
-            delta = lora_b @ lora_a.t()
-        else:
-            delta = lora_b @ lora_a
-
-        merged_f64 = base_w + scaling * delta
-        original_dtype = base_tensors[base_name].dtype
-        lora_reference[base_name] = merged_f64.to(original_dtype)
-
-    return lora_reference, base_tensors, lora_target_names
-
-
-def measure_accuracy(tool_path, lora_reference, base_tensors, lora_target_names):
-    """Measures a tool's output equivalence against the f64 gold standard.
-
-    For LoRA target tensors, checks if the tool's output is byte-identical
-    to the reference when both are in the output dtype. Also reports the
-    intermediate f64 error and the output dtype's epsilon for context.
-
-    For non-LoRA tensors, counts how many are bit-identical to the original
-    base model.
-
-    Args:
-        tool_path: Path to the tool's output directory or file.
-        lora_reference: Dict of gold standard tensors for LoRA targets
-            (already downcast to base dtype).
-        base_tensors: Dict of original base model tensors.
-        lora_target_names: Set of tensor names that are LoRA targets.
-
-    Returns:
-        Dict with accuracy metrics: lora_max_error, lora_equivalent,
-        lora_equivalent_total, output_dtype, output_epsilon,
-        non_lora_identical, non_lora_total.
-    """
-    import torch
-
-    dtype_epsilon = {
-        torch.float16: 9.77e-4,
-        torch.bfloat16: 7.81e-3,
-        torch.float32: 1.19e-7,
+    per_tool = {
+        t: {
+            "max_ulp": 0,
+            "total_ulp": 0.0,
+            "within_1_ulp": 0,
+            "total_elements": 0,
+            "lora_bytewise_count": 0,
+            "lora_tensor_count": 0,
+            "reference_dtype": None,
+            "non_lora_total": 0,
+            "non_lora_identical": 0,
+        }
+        for t in tool_paths
     }
 
-    tool_tensors = load_tensors_from_path(tool_path)
+    for base_name in sorted(lora_target_names):
+        base_w = base_name_map[base_name].get_tensor(base_name)
+        original_dtype = base_w.dtype
+        ref_t = base_w.clone()
+        del base_w
 
-    lora_max_errors = []
-    lora_equivalent_count = 0
-    lora_equivalent_total = 0
-    output_dtype = None
+        lora_a = adapter_name_map[lora_a_map[base_name]].get_tensor(
+            lora_a_map[base_name]
+        ).to(torch.float64)
+        lora_b = adapter_name_map[lora_b_map[base_name]].get_tensor(
+            lora_b_map[base_name]
+        ).to(torch.float64)
 
-    for name in sorted(lora_target_names):
-        if name not in tool_tensors or name not in lora_reference:
-            continue
+        a_view = lora_a.t() if fan_in_fan_out else lora_a
+        # Process in 512-row chunks to limit peak memory to ~512 * in_features * 8 bytes
+        chunk_rows = 512
+        for start in range(0, ref_t.shape[0], chunk_rows):
+            end = min(start + chunk_rows, ref_t.shape[0])
+            chunk_f64 = ref_t[start:end].to(torch.float64)
+            chunk_f64 += scaling * (lora_b[start:end] @ a_view)
+            ref_t[start:end] = chunk_f64.to(original_dtype)
+            del chunk_f64
+        del lora_a, lora_b, a_view
 
-        ref_t = lora_reference[name]
-        tool_t = tool_tensors[name]
+        for tool_name, (_, name_map) in tool_handle_sets.items():
+            acc = per_tool[tool_name]
+            if acc["reference_dtype"] is None:
+                acc["reference_dtype"] = original_dtype
 
-        if output_dtype is None:
-            output_dtype = ref_t.dtype
+            if base_name not in name_map:
+                continue
 
-        lora_equivalent_total += 1
-        if torch.equal(tool_t, ref_t):
-            lora_equivalent_count += 1
+            tool_t = name_map[base_name].get_tensor(base_name)
+            acc["lora_tensor_count"] += 1
 
-        diff = (tool_t.float() - ref_t.float()).abs()
-        lora_max_errors.append(diff.max().item())
+            if torch.equal(tool_t, ref_t):
+                acc["lora_bytewise_count"] += 1
+                acc["within_1_ulp"] += tool_t.numel()
+                acc["total_elements"] += tool_t.numel()
+            else:
+                mu, mean_u, w1, n = chunked_ulp_stats(tool_t, ref_t)
+                if mu > acc["max_ulp"]:
+                    acc["max_ulp"] = mu
+                acc["total_ulp"] += mean_u * n
+                acc["within_1_ulp"] += w1
+                acc["total_elements"] += n
+            del tool_t
 
-    non_lora_total = 0
-    non_lora_identical = 0
+        del ref_t
 
-    for name in base_tensors:
+    for name in base_name_set:
         if name in lora_target_names:
             continue
-        if name not in tool_tensors:
-            continue
+        base_t = base_name_map[name].get_tensor(name)
+        for tool_name, (_, name_map) in tool_handle_sets.items():
+            if name not in name_map:
+                continue
+            acc = per_tool[tool_name]
+            acc["non_lora_total"] += 1
+            tool_t = name_map[name].get_tensor(name)
+            if torch.equal(base_t, tool_t):
+                acc["non_lora_identical"] += 1
+            del tool_t
+        del base_t
 
-        non_lora_total += 1
-        if torch.equal(base_tensors[name], tool_tensors[name]):
-            non_lora_identical += 1
+    del base_name_map, base_handles, adapter_name_map, adapter_handles
+    for _, (handles, name_map) in tool_handle_sets.items():
+        del name_map, handles
+    del tool_handle_sets
 
-    max_err = max(lora_max_errors) if lora_max_errors else 0.0
-    epsilon = dtype_epsilon.get(output_dtype, 0.0)
+    results = {}
+    for tool_name, acc in per_tool.items():
+        total_elem = acc["total_elements"]
+        mean_ulp = acc["total_ulp"] / total_elem if total_elem > 0 else 0.0
+        w1_pct = 100.0 * acc["within_1_ulp"] / total_elem if total_elem > 0 else 0.0
+        results[tool_name] = {
+            "max_ulp": acc["max_ulp"],
+            "mean_ulp": mean_ulp,
+            "within_1_ulp": acc["within_1_ulp"],
+            "within_1_ulp_pct": w1_pct,
+            "total_elements": total_elem,
+            "lora_bytewise": acc["lora_bytewise_count"],
+            "lora_tensor_count": acc["lora_tensor_count"],
+            "reference_dtype": str(acc["reference_dtype"]),
+            "non_lora_identical": acc["non_lora_identical"],
+            "non_lora_total": acc["non_lora_total"],
+        }
 
-    return {
-        "lora_max_error": max_err,
-        "lora_equivalent": lora_equivalent_count,
-        "lora_equivalent_total": lora_equivalent_total,
-        "output_dtype": str(output_dtype),
-        "output_epsilon": epsilon,
-        "below_epsilon": max_err <= epsilon,
-        "non_lora_identical": non_lora_identical,
-        "non_lora_total": non_lora_total,
-    }
+    return len(lora_target_names), results
 
 
 def run_single_measurement(tool, base_dir, base_file, adapter_dir, tmp_root):
@@ -567,6 +720,18 @@ def run_single_measurement(tool, base_dir, base_file, adapter_dir, tmp_root):
         else:
             out_file = os.path.join(output_path, "merged.safetensors")
             stats = measure_surgery(base_file, adapter_dir, out_file)
+        return stats, output_path
+
+    if tool == "surgery_low_mem":
+        if os.path.isdir(base_file):
+            stats = measure_surgery(
+                base_file, adapter_dir, output_path, low_memory=True
+            )
+        else:
+            out_file = os.path.join(output_path, "merged.safetensors")
+            stats = measure_surgery(
+                base_file, adapter_dir, out_file, low_memory=True
+            )
         return stats, output_path
 
     if tool == "peft":
@@ -618,6 +783,7 @@ def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3,
         for tool in tools:
             tool_label = {
                 "surgery": "safetensors-surgery",
+                "surgery_low_mem": "surgery (low memory)",
                 "peft": "PEFT merge_and_unload",
                 "peft_low_mem": "PEFT (low memory)",
                 "mergekit": "mergekit",
@@ -685,48 +851,44 @@ def run_benchmark(label, base_dir, adapter_dir, tools, num_runs=3,
             verify_outputs(first_run_paths)
 
         if first_run_paths:
-            print("\n  Accuracy (vs f64 gold standard):")
+            print("\n  Accuracy (vs Python f64 reference):")
             try:
-                lora_ref, base_tensors, lora_targets = compute_f64_reference(
-                    base_dir, adapter_dir
-                )
-                print(f"    LoRA targets: {len(lora_targets)}")
                 tool_labels = {
                     "surgery": "safetensors-surgery",
+                    "surgery_low_mem": "surgery (low memory)",
                     "peft": "PEFT merge_and_unload",
                     "peft_low_mem": "PEFT (low memory)",
                     "mergekit": "mergekit",
                 }
 
+                lora_count, acc_results = measure_all_accuracies(
+                    first_run_paths, base_dir, adapter_dir
+                )
+                print(f"    LoRA targets: {lora_count}")
+
                 for tool in tools:
-                    if tool not in first_run_paths:
+                    if tool not in acc_results:
                         continue
-                    acc = measure_accuracy(
-                        first_run_paths[tool],
-                        lora_ref,
-                        base_tensors,
-                        lora_targets,
-                    )
+                    acc = acc_results[tool]
                     label = tool_labels.get(tool, tool)
                     pct = (
                         100.0 * acc["non_lora_identical"] / acc["non_lora_total"]
                         if acc["non_lora_total"] > 0
                         else 0.0
                     )
-                    eq_pct = (
-                        100.0 * acc["lora_equivalent"] / acc["lora_equivalent_total"]
-                        if acc["lora_equivalent_total"] > 0
+                    bw_pct = (
+                        100.0 * acc["lora_bytewise"] / acc["lora_tensor_count"]
+                        if acc["lora_tensor_count"] > 0
                         else 0.0
                     )
-                    status = "EQUIVALENT" if acc["below_epsilon"] else "DIVERGENT"
                     print(
                         f"    {label}:"
-                        f"  max_intermediate_err={acc['lora_max_error']:.2e}"
-                        f"  dtype_epsilon={acc['output_epsilon']:.2e}"
-                        f"  status={status}"
-                        f"  lora_bytewise={acc['lora_equivalent']}"
-                        f"/{acc['lora_equivalent_total']}"
-                        f" ({eq_pct:.0f}%)"
+                        f"  max_ulp={acc['max_ulp']}"
+                        f"  mean_ulp={acc['mean_ulp']:.6f}"
+                        f"  within_1_ulp={acc['within_1_ulp_pct']:.4f}%"
+                        f"  bytewise={acc['lora_bytewise']}"
+                        f"/{acc['lora_tensor_count']}"
+                        f" ({bw_pct:.0f}%)"
                         f"  passthrough="
                         f"{acc['non_lora_identical']}/{acc['non_lora_total']}"
                         f" ({pct:.0f}%)"
@@ -752,19 +914,21 @@ def print_summary(results, tools):
     """
     tool_labels = {
         "surgery": "safetensors-surgery",
+        "surgery_low_mem": "surgery (low memory)",
         "peft": "PEFT merge_and_unload",
         "peft_low_mem": "PEFT (low memory)",
         "mergekit": "mergekit",
     }
 
-    width = 120
+    width = 145
     print(f"\n{'=' * width}")
     print("RESULTS (median of all runs)")
     print(f"{'=' * width}")
     print(
         f"{'Model':<22} {'Tool':<23} "
         f"{'RSS (MB)':>10} {'Time (s)':>10} "
-        f"{'Max Err':>12} {'Status':>14} "
+        f"{'Max ULP':>10} {'Mean ULP':>12} "
+        f"{'<=1 ULP':>12} "
         f"{'Passthrough':>13}"
     )
     print("-" * width)
@@ -788,19 +952,22 @@ def print_summary(results, tools):
                     if acc["non_lora_total"] > 0
                     else 0.0
                 )
-                acc_max = f"{acc['lora_max_error']:.2e}"
-                status = "Equivalent" if acc["below_epsilon"] else "Divergent"
+                max_ulp = str(acc["max_ulp"])
+                mean_ulp = f"{acc['mean_ulp']:.6f}"
+                w1_pct = f"{acc['within_1_ulp_pct']:.4f}%"
                 passthrough = f"{pct:.0f}%"
             else:
-                acc_max = "n/a"
-                status = "n/a"
+                max_ulp = "n/a"
+                mean_ulp = "n/a"
+                w1_pct = "n/a"
                 passthrough = "n/a"
 
             print(
                 f"{label_col:<22} {tool_name:<23} "
                 f"{stats['peak_rss_mb']:>10.0f} "
                 f"{stats['wall_seconds']:>10.2f} "
-                f"{acc_max:>12} {status:>14} "
+                f"{max_ulp:>10} {mean_ulp:>12} "
+                f"{w1_pct:>12} "
                 f"{passthrough:>13}"
             )
             first_tool = False
@@ -808,7 +975,7 @@ def print_summary(results, tools):
         if surgery_stats:
             print()
             for tool in tools:
-                if tool == "surgery":
+                if tool in ("surgery", "surgery_low_mem"):
                     continue
                 stats = r.get(tool)
                 if stats is None:
@@ -841,12 +1008,14 @@ def save_chart(results, tools, output_path):
     """
     tool_labels = {
         "surgery": "safetensors-surgery",
+        "surgery_low_mem": "surgery (low memory)",
         "peft": "PEFT merge_and_unload",
         "peft_low_mem": "PEFT (low memory)",
         "mergekit": "mergekit",
     }
     tool_colors = {
         "surgery": "#2563eb",
+        "surgery_low_mem": "#60a5fa",
         "peft": "#dc2626",
         "peft_low_mem": "#ea580c",
         "mergekit": "#16a34a",
@@ -1017,11 +1186,14 @@ def save_chart(results, tools, output_path):
                 entry[f"{prefix}_all_times"] = stats["all_times"]
                 acc = stats.get("accuracy")
                 if acc:
-                    entry[f"{prefix}_lora_max_error"] = acc["lora_max_error"]
-                    entry[f"{prefix}_lora_equivalent"] = acc["lora_equivalent"]
-                    entry[f"{prefix}_lora_equivalent_total"] = acc["lora_equivalent_total"]
-                    entry[f"{prefix}_below_epsilon"] = acc["below_epsilon"]
-                    entry[f"{prefix}_output_dtype"] = acc["output_dtype"]
+                    entry[f"{prefix}_max_ulp"] = acc["max_ulp"]
+                    entry[f"{prefix}_mean_ulp"] = acc["mean_ulp"]
+                    entry[f"{prefix}_within_1_ulp"] = acc["within_1_ulp"]
+                    entry[f"{prefix}_within_1_ulp_pct"] = acc["within_1_ulp_pct"]
+                    entry[f"{prefix}_total_elements"] = acc["total_elements"]
+                    entry[f"{prefix}_lora_bytewise"] = acc["lora_bytewise"]
+                    entry[f"{prefix}_lora_tensor_count"] = acc["lora_tensor_count"]
+                    entry[f"{prefix}_reference_dtype"] = acc["reference_dtype"]
                     entry[f"{prefix}_non_lora_identical"] = acc["non_lora_identical"]
                     entry[f"{prefix}_non_lora_total"] = acc["non_lora_total"]
             else:
@@ -1029,8 +1201,17 @@ def save_chart(results, tools, output_path):
                 entry[f"{prefix}_wall_seconds"] = None
         export.append(entry)
 
-    with open(results_json, "w") as f:
-        json.dump(export, f, indent=2)
+    tmp_fd, tmp_path = tempfile.mkstemp(
+        dir=os.path.dirname(results_json) or ".",
+        suffix=".tmp",
+    )
+    try:
+        with os.fdopen(tmp_fd, "w") as f:
+            json.dump(export, f, indent=2)
+        os.replace(tmp_path, results_json)
+    except:
+        os.unlink(tmp_path)
+        raise
     print(f"Raw data saved to {results_json}")
 
 
@@ -1043,7 +1224,7 @@ def check_tool_available(tool):
     Returns:
         True if the tool can be used, False otherwise.
     """
-    if tool == "surgery":
+    if tool in ("surgery", "surgery_low_mem"):
         try:
             find_cli_binary()
             return True
@@ -1076,11 +1257,11 @@ def main():
         )
     )
     parser.add_argument(
-        "--models",
-        nargs="+",
-        choices=list(PRESET_MODELS.keys()),
-        default=["opt-350m"],
-        help="Which preset models to benchmark",
+            "--models",
+            nargs="+",
+            choices=list(PRESET_MODELS.keys()) + ["all"],
+            default=["opt-350m"],
+            help="Which preset models to benchmark (use 'all' for everything)",
     )
     parser.add_argument(
         "--base",
@@ -1149,6 +1330,8 @@ def main():
 
     results = []
 
+    model_keys = list(PRESET_MODELS.keys()) if "all" in args.models else args.models
+
     if args.base and args.adapter:
         result = run_benchmark(
             "Custom", args.base, args.adapter, tools,
@@ -1156,7 +1339,7 @@ def main():
         )
         results.append(result)
     else:
-        for model_key in args.models:
+        for model_key in model_keys:
             preset = PRESET_MODELS[model_key]
             base_dir = preset["base"]
             adapter_dir = preset["adapter"]
@@ -1168,7 +1351,9 @@ def main():
 
     print_summary(results, tools)
 
-    os.makedirs(os.path.dirname(args.output), exist_ok=True)
+    dirname = os.path.dirname(args.output)
+    if dirname:
+        os.makedirs(dirname, exist_ok=True)
     save_chart(results, tools, args.output)
 
 

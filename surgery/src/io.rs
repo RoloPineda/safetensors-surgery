@@ -272,6 +272,12 @@ pub(crate) fn compute_dry_run_info(
         estimated_output_bytes: estimated_bytes,
         is_sharded,
         shard_count,
+        rank: config.rank(),
+        alpha: config.alpha(),
+        scaling: config.scaling(),
+        target_modules: config.target_modules().to_vec(),
+        fan_in_fan_out: config.fan_in_fan_out(),
+        bias_mode: format!("{:?}", config.bias()),
     })
 }
 
@@ -339,6 +345,8 @@ fn dtype_to_string(dtype: Dtype) -> &'static str {
 }
 
 /// Processes a single tensor: merge, replace, bias-merge, or pass-through.
+// Merge dispatch needs the tensor context, adapter handle, config,
+// name mapping, memory mode, and output writer. A struct would obscure the flow.
 #[allow(clippy::too_many_arguments)]
 fn process_tensor(
     name: &str,
@@ -528,7 +536,13 @@ pub fn merge_and_write(
         progress(total_tensors, total_tensors);
     }
 
-    writer.flush()?;
+    let file = writer.into_inner().map_err(|e| {
+        SurgeryError::Io(std::io::Error::other(format!(
+            "failed to flush output buffer: {}",
+            e.error()
+        )))
+    })?;
+    file.sync_all()?;
     Ok(stats)
 }
 
@@ -551,6 +565,42 @@ pub(crate) fn merge_sharded(
     low_memory: bool,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MergeStats> {
+    let base_canonical = base_dir.canonicalize().map_err(|e| {
+        SurgeryError::Io(std::io::Error::new(
+            e.kind(),
+            format!(
+                "cannot canonicalize base dir '{}': {}",
+                base_dir.display(),
+                e
+            ),
+        ))
+    })?;
+    let output_canonical = if output_dir.exists() {
+        output_dir.canonicalize().map_err(|e| {
+            SurgeryError::Io(std::io::Error::new(
+                e.kind(),
+                format!(
+                    "cannot canonicalize output dir '{}': {}",
+                    output_dir.display(),
+                    e
+                ),
+            ))
+        })?
+    } else {
+        // If output doesn't exist yet, canonicalize the parent
+        let parent = output_dir.parent().unwrap_or(Path::new("."));
+        let parent_canonical = parent
+            .canonicalize()
+            .unwrap_or_else(|_| parent.to_path_buf());
+        parent_canonical.join(output_dir.file_name().unwrap_or_default())
+    };
+    if base_canonical == output_canonical {
+        return Err(SurgeryError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "output directory must differ from base model directory to prevent data corruption",
+        )));
+    }
+
     let adapter = MappedSafetensors::open(adapter_weights_path)?;
 
     let shard_filenames = index.shard_filenames();
@@ -579,6 +629,13 @@ pub(crate) fn merge_sharded(
     let mut tensors_processed: usize = 0;
 
     for shard_filename in &shard_filenames {
+        // Validate shard filename doesn't escape the base directory
+        if shard_filename.contains("..") || Path::new(shard_filename).is_absolute() {
+            return Err(SurgeryError::ShardingError(format!(
+                "shard filename '{}' contains path traversal or is absolute",
+                shard_filename
+            )));
+        }
         let shard_path = base_dir.join(shard_filename);
         let shard = MappedSafetensors::open(&shard_path)?;
         shard.advise_sequential();
@@ -619,7 +676,13 @@ pub(crate) fn merge_sharded(
             tensors_processed += 1;
         }
 
-        writer.flush()?;
+        let file = writer.into_inner().map_err(|e| {
+            SurgeryError::Io(std::io::Error::other(format!(
+                "failed to flush output buffer: {}",
+                e.error()
+            )))
+        })?;
+        file.sync_all()?;
         shard.advise_dontneed();
     }
 
