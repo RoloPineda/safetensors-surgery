@@ -8,100 +8,119 @@ use safetensors::Dtype;
 
 use crate::{Result, SurgeryError};
 
-/// Converts raw tensor bytes to an `Array2<f32>`, upcasting from the storage dtype.
-pub fn bytes_to_f32(
-    bytes: &[u8],
-    dtype: Dtype,
-    shape: &[usize],
-    name: &str,
-) -> Result<Array2<f32>> {
-    if shape.len() != 2 {
-        return Err(SurgeryError::ShapeMismatch {
-            name: format!("{name} (expected 2D)"),
-            expected: vec![2],
-            got: vec![shape.len()],
-        });
-    }
-    let (rows, cols) = (shape[0], shape[1]);
-    let expected_elements = rows * cols;
+/// Generates a `bytes -> Array2<T>` conversion function for a given numeric type.
+/// Each invocation produces a public function that decodes F16, BF16, or F32 storage
+/// bytes into the target type, with shape and length validation.
+macro_rules! impl_bytes_to_array {
+    ($(#[doc = $doc:expr])* $fn_name:ident -> $out_ty:ty, f16: $f16_conv:expr, bf16: $bf16_conv:expr, f32: $f32_conv:expr) => {
+        $(#[doc = $doc])*
+        pub fn $fn_name(
+            bytes: &[u8],
+            dtype: Dtype,
+            shape: &[usize],
+            name: &str,
+        ) -> Result<Array2<$out_ty>> {
+            if shape.len() != 2 {
+                return Err(SurgeryError::ShapeMismatch {
+                    name: format!("{name} (expected 2D)"),
+                    expected: vec![2],
+                    got: vec![shape.len()],
+                });
+            }
+            let (rows, cols) = (shape[0], shape[1]);
+            let expected_elements = rows * cols;
 
-    let values: Vec<f32> = match dtype {
-        Dtype::F16 => {
-            if bytes.len() != expected_elements * 2 {
+            let (elem_size, converter): (usize, Box<dyn Fn(&[u8]) -> $out_ty>) = match dtype {
+                Dtype::F16 => (2, Box::new($f16_conv)),
+                Dtype::BF16 => (2, Box::new($bf16_conv)),
+                Dtype::F32 => (4, Box::new($f32_conv)),
+                _ => {
+                    return Err(SurgeryError::UnsupportedDtype {
+                        name: name.to_string(),
+                        dtype: format!("{dtype:?}"),
+                    });
+                }
+            };
+
+            let expected_bytes = expected_elements * elem_size;
+            if bytes.len() != expected_bytes {
                 return Err(SurgeryError::ShapeMismatch {
                     name: name.to_string(),
-                    expected: vec![expected_elements * 2],
+                    expected: vec![expected_bytes],
                     got: vec![bytes.len()],
                 });
             }
-            bytes
-                .chunks_exact(2)
-                .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                .collect()
-        }
-        Dtype::BF16 => {
-            if bytes.len() != expected_elements * 2 {
-                return Err(SurgeryError::ShapeMismatch {
-                    name: name.to_string(),
-                    expected: vec![expected_elements * 2],
-                    got: vec![bytes.len()],
-                });
-            }
-            bytes
-                .chunks_exact(2)
-                .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]).to_f32())
-                .collect()
-        }
-        Dtype::F32 => {
-            if bytes.len() != expected_elements * 4 {
-                return Err(SurgeryError::ShapeMismatch {
-                    name: name.to_string(),
-                    expected: vec![expected_elements * 4],
-                    got: vec![bytes.len()],
-                });
-            }
-            bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]))
-                .collect()
-        }
-        _ => {
-            return Err(SurgeryError::UnsupportedDtype {
+
+            let values: Vec<$out_ty> = bytes.chunks_exact(elem_size).map(|c| converter(c)).collect();
+
+            Array2::from_shape_vec((rows, cols), values).map_err(|_| SurgeryError::ShapeMismatch {
                 name: name.to_string(),
-                dtype: format!("{dtype:?}"),
-            });
+                expected: vec![rows, cols],
+                got: shape.to_vec(),
+            })
         }
     };
-
-    Array2::from_shape_vec((rows, cols), values).map_err(|_| SurgeryError::ShapeMismatch {
-        name: name.to_string(),
-        expected: vec![rows, cols],
-        got: shape.to_vec(),
-    })
 }
 
-/// Converts an `Array2<f32>` back to raw bytes, downcasting to the storage dtype.
-pub fn f32_to_bytes(array: &Array2<f32>, dtype: Dtype) -> Result<Vec<u8>> {
-    let values = array.as_slice().ok_or_else(|| {
-        SurgeryError::Safetensors("array is not contiguous in memory".to_string())
-    })?;
+/// Generates an `Array2<T> -> bytes` conversion function for a given numeric type.
+/// Each invocation produces a public function that encodes array values into F16,
+/// BF16, or F32 storage bytes.
+macro_rules! impl_array_to_bytes {
+    ($(#[doc = $doc:expr])* $fn_name:ident <- $in_ty:ty, f16: $f16_conv:expr, bf16: $bf16_conv:expr, f32: $f32_conv:expr) => {
+        $(#[doc = $doc])*
+        pub fn $fn_name(array: &Array2<$in_ty>, dtype: Dtype) -> Result<Vec<u8>> {
+            let values = array.as_slice().ok_or_else(|| {
+                SurgeryError::Safetensors("array is not contiguous in memory".to_string())
+            })?;
 
-    match dtype {
-        Dtype::F16 => Ok(values
-            .iter()
-            .flat_map(|&v| f16::from_f32(v).to_le_bytes())
-            .collect()),
-        Dtype::BF16 => Ok(values
-            .iter()
-            .flat_map(|&v| bf16::from_f32(v).to_le_bytes())
-            .collect()),
-        Dtype::F32 => Ok(values.iter().flat_map(|&v| v.to_le_bytes()).collect()),
-        _ => Err(SurgeryError::UnsupportedDtype {
-            name: "output".to_string(),
-            dtype: format!("{dtype:?}"),
-        }),
-    }
+            let converter: Box<dyn Fn(&$in_ty) -> Vec<u8>> = match dtype {
+                Dtype::F16 => Box::new($f16_conv),
+                Dtype::BF16 => Box::new($bf16_conv),
+                Dtype::F32 => Box::new($f32_conv),
+                _ => {
+                    return Err(SurgeryError::UnsupportedDtype {
+                        name: "output".to_string(),
+                        dtype: format!("{dtype:?}"),
+                    });
+                }
+            };
+
+            Ok(values.iter().flat_map(|v| converter(v)).collect())
+        }
+    };
 }
+
+impl_bytes_to_array!(
+    /// Converts raw tensor bytes to an `Array2<f32>`, upcasting from the storage dtype.
+    bytes_to_f32 -> f32,
+    f16: |c: &[u8]| f16::from_le_bytes([c[0], c[1]]).to_f32(),
+    bf16: |c: &[u8]| bf16::from_le_bytes([c[0], c[1]]).to_f32(),
+    f32: |c: &[u8]| f32::from_le_bytes([c[0], c[1], c[2], c[3]])
+);
+
+impl_array_to_bytes!(
+    /// Converts an `Array2<f32>` back to raw bytes, downcasting to the storage dtype.
+    f32_to_bytes <- f32,
+    f16: |v: &f32| f16::from_f32(*v).to_le_bytes().to_vec(),
+    bf16: |v: &f32| bf16::from_f32(*v).to_le_bytes().to_vec(),
+    f32: |v: &f32| v.to_le_bytes().to_vec()
+);
+
+impl_bytes_to_array!(
+    /// Converts raw tensor bytes to an `Array2<f64>`, upcasting from the storage dtype.
+    bytes_to_f64 -> f64,
+    f16: |c: &[u8]| f16::from_le_bytes([c[0], c[1]]).to_f64(),
+    bf16: |c: &[u8]| bf16::from_le_bytes([c[0], c[1]]).to_f64(),
+    f32: |c: &[u8]| f32::from_le_bytes([c[0], c[1], c[2], c[3]]) as f64
+);
+
+impl_array_to_bytes!(
+    /// Converts an `Array2<f64>` to raw bytes, downcasting to the storage dtype.
+    f64_to_bytes <- f64,
+    f16: |v: &f64| f16::from_f64(*v).to_le_bytes().to_vec(),
+    bf16: |v: &f64| bf16::from_f64(*v).to_le_bytes().to_vec(),
+    f32: |v: &f64| (*v as f32).to_le_bytes().to_vec()
+);
 
 /// Computes `W_base + (alpha / r) * (lora_B @ lora_A)`.
 ///
@@ -150,78 +169,6 @@ pub fn merge_lora(
     };
 
     Ok(base + &(delta * scaling))
-}
-
-/// Converts raw tensor bytes to an `Array2<f64>`, upcasting from the storage dtype.
-pub fn bytes_to_f64(
-    bytes: &[u8],
-    dtype: Dtype,
-    shape: &[usize],
-    name: &str,
-) -> Result<Array2<f64>> {
-    if shape.len() != 2 {
-        return Err(SurgeryError::ShapeMismatch {
-            name: format!("{name} (expected 2D)"),
-            expected: vec![2],
-            got: vec![shape.len()],
-        });
-    }
-    let (rows, cols) = (shape[0], shape[1]);
-    let expected_elements = rows * cols;
-
-    let values: Vec<f64> = match dtype {
-        Dtype::F16 => {
-            if bytes.len() != expected_elements * 2 {
-                return Err(SurgeryError::ShapeMismatch {
-                    name: name.to_string(),
-                    expected: vec![expected_elements * 2],
-                    got: vec![bytes.len()],
-                });
-            }
-            bytes
-                .chunks_exact(2)
-                .map(|chunk| f16::from_le_bytes([chunk[0], chunk[1]]).to_f64())
-                .collect()
-        }
-        Dtype::BF16 => {
-            if bytes.len() != expected_elements * 2 {
-                return Err(SurgeryError::ShapeMismatch {
-                    name: name.to_string(),
-                    expected: vec![expected_elements * 2],
-                    got: vec![bytes.len()],
-                });
-            }
-            bytes
-                .chunks_exact(2)
-                .map(|chunk| bf16::from_le_bytes([chunk[0], chunk[1]]).to_f64())
-                .collect()
-        }
-        Dtype::F32 => {
-            if bytes.len() != expected_elements * 4 {
-                return Err(SurgeryError::ShapeMismatch {
-                    name: name.to_string(),
-                    expected: vec![expected_elements * 4],
-                    got: vec![bytes.len()],
-                });
-            }
-            bytes
-                .chunks_exact(4)
-                .map(|chunk| f32::from_le_bytes([chunk[0], chunk[1], chunk[2], chunk[3]]) as f64)
-                .collect()
-        }
-        _ => {
-            return Err(SurgeryError::UnsupportedDtype {
-                name: name.to_string(),
-                dtype: format!("{dtype:?}"),
-            });
-        }
-    };
-
-    Array2::from_shape_vec((rows, cols), values).map_err(|_| SurgeryError::ShapeMismatch {
-        name: name.to_string(),
-        expected: vec![rows, cols],
-        got: shape.to_vec(),
-    })
 }
 
 /// Merges LoRA weights into base tensor bytes with f64-accurate matmul.
@@ -417,32 +364,6 @@ pub fn streaming_lora_merge_write(
     Ok(())
 }
 
-/// Converts an `Array2<f64>` to raw bytes, downcasting to the storage dtype.
-pub fn f64_to_bytes(array: &Array2<f64>, dtype: Dtype) -> Result<Vec<u8>> {
-    let values = array.as_slice().ok_or_else(|| {
-        SurgeryError::Safetensors("array is not contiguous in memory".to_string())
-    })?;
-
-    match dtype {
-        Dtype::F16 => Ok(values
-            .iter()
-            .flat_map(|&v| f16::from_f64(v).to_le_bytes())
-            .collect()),
-        Dtype::BF16 => Ok(values
-            .iter()
-            .flat_map(|&v| bf16::from_f64(v).to_le_bytes())
-            .collect()),
-        Dtype::F32 => Ok(values
-            .iter()
-            .flat_map(|&v| (v as f32).to_le_bytes())
-            .collect()),
-        _ => Err(SurgeryError::UnsupportedDtype {
-            name: "output".to_string(),
-            dtype: format!("{dtype:?}"),
-        }),
-    }
-}
-
 /// Adds adapter bias values to base bias values element-wise.
 pub fn merge_bias(base_bias: &Array2<f32>, adapter_bias: &Array2<f32>) -> Result<Array2<f32>> {
     if base_bias.shape() != adapter_bias.shape() {
@@ -454,6 +375,7 @@ pub fn merge_bias(base_bias: &Array2<f32>, adapter_bias: &Array2<f32>) -> Result
     }
     Ok(base_bias + adapter_bias)
 }
+
 #[cfg(test)]
 mod tests {
     use super::*;
