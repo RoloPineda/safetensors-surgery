@@ -124,7 +124,7 @@ impl_array_to_bytes!(
 
 /// Computes `W_base + (alpha / r) * (lora_B @ lora_A)`.
 ///
-/// When `fan_in_fan_out` is true, `lora_A` is transposed before the matmul.
+/// When `fan_in_fan_out` is true, the delta is transposed: `(B @ A).T`.
 pub fn merge_lora(
     base: &Array2<f32>,
     lora_a: &Array2<f32>,
@@ -132,41 +132,27 @@ pub fn merge_lora(
     scaling: f32,
     fan_in_fan_out: bool,
 ) -> Result<Array2<f32>> {
-    let a_cols = if fan_in_fan_out {
-        lora_a.nrows()
-    } else {
-        lora_a.ncols()
-    };
-    if lora_b.ncols()
-        != (if fan_in_fan_out {
-            lora_a.ncols()
-        } else {
-            lora_a.nrows()
-        })
-    {
+    if lora_b.ncols() != lora_a.nrows() {
         return Err(SurgeryError::ShapeMismatch {
             name: "LoRA matmul inner dimension".to_string(),
             expected: vec![lora_b.ncols()],
-            got: vec![if fan_in_fan_out {
-                lora_a.ncols()
-            } else {
-                lora_a.nrows()
-            }],
-        });
-    }
-    if lora_b.nrows() != base.nrows() || a_cols != base.ncols() {
-        return Err(SurgeryError::ShapeMismatch {
-            name: "LoRA delta vs base".to_string(),
-            expected: vec![base.nrows(), base.ncols()],
-            got: vec![lora_b.nrows(), a_cols],
+            got: vec![lora_a.nrows()],
         });
     }
 
     let delta = if fan_in_fan_out {
-        lora_b.dot(&lora_a.t())
+        lora_b.dot(lora_a).t().to_owned()
     } else {
         lora_b.dot(lora_a)
     };
+
+    if delta.nrows() != base.nrows() || delta.ncols() != base.ncols() {
+        return Err(SurgeryError::ShapeMismatch {
+            name: "LoRA delta vs base".to_string(),
+            expected: vec![base.nrows(), base.ncols()],
+            got: vec![delta.nrows(), delta.ncols()],
+        });
+    }
 
     Ok(base + &(delta * scaling))
 }
@@ -229,44 +215,35 @@ pub fn streaming_lora_merge_write(
 
     // Validate LoRA dimensions before matmul to return a clean error
     // instead of panicking inside ndarray's dot().
-    if lora_b.nrows() != rows {
+    // B is [out_features, rank], A is [rank, in_features].
+    // Without fan_in_fan_out: delta = B @ A, shape [out_features, in_features] = [rows, cols].
+    // With fan_in_fan_out: delta = (B @ A).T, base is stored as [in_features, out_features].
+    let (expected_b_rows, expected_a_cols) = if fan_in_fan_out {
+        (cols, rows)
+    } else {
+        (rows, cols)
+    };
+    if lora_b.nrows() != expected_b_rows {
         return Err(SurgeryError::ShapeMismatch {
-            name: "lora_B rows vs base rows".to_string(),
-            expected: vec![rows],
+            name: "lora_B rows vs base".to_string(),
+            expected: vec![expected_b_rows],
             got: vec![lora_b.nrows()],
         });
     }
-    let a_out_cols = if fan_in_fan_out {
-        lora_a.nrows()
-    } else {
-        lora_a.ncols()
-    };
-    if a_out_cols != cols {
+    if lora_a.ncols() != expected_a_cols {
         return Err(SurgeryError::ShapeMismatch {
-            name: "lora_A output cols vs base cols".to_string(),
-            expected: vec![cols],
-            got: vec![a_out_cols],
+            name: "lora_A cols vs base".to_string(),
+            expected: vec![expected_a_cols],
+            got: vec![lora_a.ncols()],
         });
     }
-    let inner_b = lora_b.ncols();
-    let inner_a = if fan_in_fan_out {
-        lora_a.ncols()
-    } else {
-        lora_a.nrows()
-    };
-    if inner_b != inner_a {
+    if lora_b.ncols() != lora_a.nrows() {
         return Err(SurgeryError::ShapeMismatch {
-            name: "LoRA matmul inner dimension".to_string(),
-            expected: vec![inner_b],
-            got: vec![inner_a],
+            name: "LoRA matmul inner dimension (rank)".to_string(),
+            expected: vec![lora_b.ncols()],
+            got: vec![lora_a.nrows()],
         });
     }
-
-    let a_view = if fan_in_fan_out {
-        lora_a.t()
-    } else {
-        lora_a.view()
-    };
 
     if low_memory {
         const TILE_ROWS: usize = 512;
@@ -275,8 +252,16 @@ pub fn streaming_lora_merge_write(
             let end = (start + TILE_ROWS).min(rows);
             let tile_rows = end - start;
 
-            let tile_b = lora_b.slice(s![start..end, ..]).to_owned();
-            let delta_f64 = tile_b.dot(&a_view) * scaling;
+            // Without fan_in_fan_out: rows [start..end] of B @ A = B[start..end, :] @ A.
+            // With fan_in_fan_out: rows [start..end] of (B @ A).T = cols [start..end] of B @ A
+            //   = B @ A[:, start..end], then transpose.
+            let delta_f64 = if fan_in_fan_out {
+                let tile_a = lora_a.slice(s![.., start..end]);
+                (lora_b.dot(&tile_a) * scaling).t().to_owned()
+            } else {
+                let tile_b = lora_b.slice(s![start..end, ..]).to_owned();
+                tile_b.dot(lora_a) * scaling
+            };
             let delta_f32 = delta_f64.mapv(|v| v as f32);
 
             let base_offset = start * row_bytes;
@@ -291,7 +276,14 @@ pub fn streaming_lora_merge_write(
             start = end;
         }
     } else {
-        let delta_f64 = lora_b.dot(&a_view) * scaling;
+        let delta_f64 = if fan_in_fan_out {
+            (lora_b.dot(lora_a) * scaling)
+                .t()
+                .as_standard_layout()
+                .into_owned()
+        } else {
+            lora_b.dot(lora_a) * scaling
+        };
 
         let delta_shape = delta_f64.shape();
         if delta_shape[0] != rows || delta_shape[1] != cols {
@@ -430,17 +422,18 @@ mod tests {
     #[test]
     fn merge_lora_fan_in_fan_out() {
         let base = Array2::from_shape_vec((2, 2), vec![1.0, 0.0, 0.0, 1.0]).unwrap();
-        let lora_a = Array2::from_shape_vec((2, 1), vec![1.0, 2.0]).unwrap();
+        let lora_a = Array2::from_shape_vec((1, 2), vec![1.0, 2.0]).unwrap();
         let lora_b = Array2::from_shape_vec((2, 1), vec![3.0, 4.0]).unwrap();
         let scaling = 1.0;
 
         let merged = merge_lora(&base, &lora_a, &lora_b, scaling, true).unwrap();
 
-        // A^T = [[1, 2]], B @ A^T = [[3,6],[4,8]]
-        // merged = base + delta = [[4,6],[4,9]]
+        // B @ A = [[3],[4]] @ [[1,2]] = [[3,6],[4,8]]
+        // (B @ A).T = [[3,4],[6,8]]
+        // merged = base + delta = [[4,4],[6,9]]
         assert_eq!(merged[[0, 0]], 4.0);
-        assert_eq!(merged[[0, 1]], 6.0);
-        assert_eq!(merged[[1, 0]], 4.0);
+        assert_eq!(merged[[0, 1]], 4.0);
+        assert_eq!(merged[[1, 0]], 6.0);
         assert_eq!(merged[[1, 1]], 9.0);
     }
 
