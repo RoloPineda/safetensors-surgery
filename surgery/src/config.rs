@@ -30,6 +30,7 @@ pub struct AdapterConfig {
     peft_type: String,
 }
 
+// Required by serde's `#[serde(default = "...")]` since BiasMode does not implement Default.
 fn default_bias() -> BiasMode {
     BiasMode::None
 }
@@ -55,15 +56,28 @@ impl AdapterConfig {
                 "rank (r) must be greater than zero".to_string(),
             ));
         }
+        if !config.lora_alpha.is_finite() {
+            return Err(SurgeryError::InvalidConfig(format!(
+                "lora_alpha must be finite, got {}",
+                config.lora_alpha
+            )));
+        }
+        if config.target_modules.is_empty() {
+            return Err(SurgeryError::InvalidConfig(
+                "target_modules must not be empty".to_string(),
+            ));
+        }
         Ok(config)
     }
 
     /// Returns the LoRA rank.
+    #[must_use]
     pub fn rank(&self) -> u32 {
         self.r
     }
 
     /// Returns the LoRA alpha value.
+    #[must_use]
     pub fn alpha(&self) -> f32 {
         self.lora_alpha
     }
@@ -75,21 +89,25 @@ impl AdapterConfig {
     }
 
     /// Returns the target module names for LoRA application.
+    #[must_use]
     pub fn target_modules(&self) -> &[String] {
         &self.target_modules
     }
 
     /// Returns whether Conv1D-style transposition is enabled.
+    #[must_use]
     pub fn fan_in_fan_out(&self) -> bool {
         self.fan_in_fan_out
     }
 
     /// Returns the bias handling mode.
+    #[must_use]
     pub fn bias(&self) -> &BiasMode {
         &self.bias
     }
 
     /// Returns modules whose weights are fully replaced (not low-rank merged).
+    #[must_use]
     pub fn modules_to_save(&self) -> Option<&[String]> {
         self.modules_to_save.as_deref()
     }

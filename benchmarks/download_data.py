@@ -54,6 +54,17 @@ MODELS = {
         },
         "size": "~15GB",
     },
+    "llama3-70b": {
+        "base": {
+            "repo": "failspy/llama-3-70B-Instruct-abliterated",
+            "local": "benchmarks/data/llama3-70b/base",
+        },
+        "adapter": {
+            "repo": "mlabonne/Llama-3-70B-Instruct-abliterated-LORA",
+            "local": "benchmarks/data/llama3-70b/adapter",
+        },
+        "size": "~124GB"
+    }
 }
 
 
@@ -164,6 +175,7 @@ def main():
         )
         sys.exit(1)
 
+    failures = 0
     for key in model_keys:
         info = MODELS[key]
         print(f"\n{'=' * 50}")
@@ -184,10 +196,15 @@ def main():
                 print(f"  {part}: done -> {local}")
             except Exception as e:
                 print(f"  {part}: FAILED - {e}", file=sys.stderr)
+                failures += 1
 
     print("\nDone. Run benchmarks with:")
     model_list = " ".join(model_keys)
     print(f"  python3 benchmarks/compare.py --models {model_list}")
+
+    if failures:
+        print(f"\n{failures} download(s) failed.", file=sys.stderr)
+        sys.exit(1)
 
 
 if __name__ == "__main__":

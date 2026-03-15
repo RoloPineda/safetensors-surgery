@@ -4,6 +4,7 @@ pub mod config;
 pub mod io;
 pub mod merge;
 pub mod names;
+extern crate blas_src;
 
 use std::path::Path;
 
@@ -71,17 +72,29 @@ pub struct DryRunInfo {
 }
 
 /// Inspects a base model and adapter without writing output.
+#[must_use = "dry run info should be used or displayed"]
 pub fn dry_run_info(base_model_path: &Path, adapter_path: &Path) -> Result<DryRunInfo> {
     let adapter_config_path = adapter_path.join("adapter_config.json");
     let adapter_config = config::AdapterConfig::from_path(&adapter_config_path)?;
     let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
+    if !adapter_weights_path.exists() {
+        return Err(SurgeryError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "adapter weights not found at '{}'",
+                adapter_weights_path.display()
+            ),
+        )));
+    }
 
     io::compute_dry_run_info(base_model_path, &adapter_weights_path, &adapter_config)
 }
 
 /// Merges a LoRA adapter into a base model, writing the result to the output path.
 ///
-/// Memory usage is bounded by one tensor at a time regardless of model size.
+/// When `low_memory` is true, the merge uses tiled computation to reduce peak
+/// memory at the cost of speed. When false, the full delta matrix is materialized
+/// for faster merging.
 ///
 /// `base_model_path` can be:
 /// - A `.safetensors` file (single-file model)
@@ -90,16 +103,29 @@ pub fn dry_run_info(base_model_path: &Path, adapter_path: &Path) -> Result<DryRu
 ///
 /// For single-file models, `output_path` is the output `.safetensors` file.
 /// For sharded models, `output_path` is the output directory (shards + index.json).
+///
+/// `progress` is called with `(current_tensor_index, total_tensor_count)` after
+/// each tensor is processed. Pass `None` to disable progress reporting.
 pub fn merge_adapter(
     base_model_path: &Path,
     adapter_path: &Path,
     output_path: &Path,
+    low_memory: bool,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MergeStats> {
     let adapter_config_path = adapter_path.join("adapter_config.json");
     let adapter_config = config::AdapterConfig::from_path(&adapter_config_path)?;
 
     let adapter_weights_path = adapter_path.join("adapter_model.safetensors");
+    if !adapter_weights_path.exists() {
+        return Err(SurgeryError::Io(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!(
+                "adapter weights not found at '{}'",
+                adapter_weights_path.display()
+            ),
+        )));
+    }
 
     match io::resolve_base_model(base_model_path)? {
         io::BaseModelSource::SingleFile(base_file) => io::merge_and_write(
@@ -107,6 +133,7 @@ pub fn merge_adapter(
             &adapter_weights_path,
             &adapter_config,
             output_path,
+            low_memory,
             progress,
         ),
         io::BaseModelSource::Sharded { dir, index } => io::merge_sharded(
@@ -115,6 +142,7 @@ pub fn merge_adapter(
             &adapter_weights_path,
             &adapter_config,
             output_path,
+            low_memory,
             progress,
         ),
     }

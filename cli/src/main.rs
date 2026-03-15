@@ -22,8 +22,12 @@ struct Args {
     output: PathBuf,
 
     /// Print what would be done without writing output.
-    #[arg(long, default_value_t = false)]
+    #[arg(long)]
     dry_run: bool,
+
+    /// Use tiled merge to reduce peak memory at the cost of speed.
+    #[arg(long)]
+    low_memory: bool,
 }
 
 fn main() -> Result<()> {
@@ -67,9 +71,18 @@ fn main() -> Result<()> {
     pb.set_style(
         ProgressStyle::default_bar()
             .template("[{elapsed_precise}] {bar:40.cyan/blue} {pos}/{len} tensors")
-            .unwrap()
+            .context("invalid progress bar template")?
             .progress_chars("##-"),
     );
+
+    if let Some(parent) = args.output.parent() {
+        if !parent.as_os_str().is_empty() && !parent.exists() {
+            anyhow::bail!(
+                "output parent directory '{}' does not exist",
+                parent.display()
+            );
+        }
+    }
 
     let progress_callback = |current: usize, total: usize| {
         pb.set_length(total as u64);
@@ -80,6 +93,7 @@ fn main() -> Result<()> {
         &args.base_model,
         &args.adapter,
         &args.output,
+        args.low_memory,
         Some(&progress_callback),
     )
     .context("merge failed")?;

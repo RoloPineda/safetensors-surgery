@@ -80,7 +80,7 @@ fn merge_two_4x4_lora_targets() {
         ],
     );
 
-    // ── Adapter: rank=2, alpha=4, scaling = alpha/r = 2.0 ──
+    // Adapter: rank=2, alpha=4, scaling = alpha/r = 2.0
     //
     // q_proj lora_A [2, 4]:  [[1, 0, 0, 0],
     //                         [0, 1, 0, 0]]
@@ -180,7 +180,8 @@ fn merge_two_4x4_lora_targets() {
     }"#;
     fs::write(adapter_dir.join("adapter_config.json"), config).unwrap();
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 2);
     assert_eq!(stats.tensors_copied, 0);
@@ -371,7 +372,8 @@ fn merge_with_passthrough_tensors() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_copied, 1);
     assert_eq!(stats.tensors_merged, 1);
@@ -461,7 +463,8 @@ fn merge_with_bias_lora_only() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 1);
     assert_eq!(stats.biases_merged, 1);
@@ -540,7 +543,8 @@ fn merge_with_modules_to_save() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 1);
     assert_eq!(stats.tensors_replaced, 1);
@@ -614,7 +618,8 @@ fn merge_bf16_preserves_dtype() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
     assert_eq!(stats.tensors_merged, 1);
 
     // Verify output dtype is BF16
@@ -686,7 +691,8 @@ fn merge_f16_preserves_dtype() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
     assert_eq!(stats.tensors_merged, 1);
 
     let (_, dtype, _) = read_tensor_info(&output_path, "model.layers.0.self_attn.q_proj.weight");
@@ -724,11 +730,13 @@ fn merge_with_fan_in_fan_out() {
     );
 
     // With fan_in_fan_out=true:
-    // lora_A shape [2, 1]: [[1], [2]]  -> A^T = [[1, 2]]
-    // lora_B shape [2, 1]: [[3], [4]]
-    // B @ A^T = [[3],[4]] @ [[1,2]] = [[3,6],[4,8]]
+    // Base shape [2, 2] stored as [in_features, out_features]
+    // lora_A shape [r, in_features] = [1, 2]: [[1, 2]]
+    // lora_B shape [out_features, r] = [2, 1]: [[3], [4]]
+    // B @ A = [[3],[4]] @ [[1,2]] = [[3,6],[4,8]]
+    // delta = (B @ A)^T = [[3,4],[6,8]]
     // scaling = alpha/r = 1/1 = 1.0
-    // merged = [[1,0],[0,1]] + 1.0 * [[3,6],[4,8]] = [[4,6],[4,9]]
+    // merged = [[1,0],[0,1]] + 1.0 * [[3,4],[6,8]] = [[4,4],[6,9]]
     let lora_a: [f32; 2] = [1.0, 2.0];
     let lora_b: [f32; 2] = [3.0, 4.0];
 
@@ -738,7 +746,7 @@ fn merge_with_fan_in_fan_out() {
             (
                 "base_model.model.model.layers.0.self_attn.q_proj.lora_A.weight",
                 &lora_a,
-                vec![2, 1],
+                vec![1, 2],
             ),
             (
                 "base_model.model.model.layers.0.self_attn.q_proj.lora_B.weight",
@@ -760,12 +768,13 @@ fn merge_with_fan_in_fan_out() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None).unwrap();
+    let stats =
+        surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None).unwrap();
     assert_eq!(stats.tensors_merged, 1);
 
     let values = read_f32_tensor(&output_path, "model.layers.0.self_attn.q_proj.weight");
     #[rustfmt::skip]
-    let expected: [f32; 4] = [4.0, 6.0, 4.0, 9.0];
+    let expected: [f32; 4] = [4.0, 4.0, 6.0, 9.0];
     for (i, (got, want)) in values.iter().zip(expected.iter()).enumerate() {
         assert!(
             (got - want).abs() < 1e-6,
@@ -917,7 +926,14 @@ fn merge_with_progress_callback() {
         call_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
     };
 
-    surgery::merge_adapter(&base_path, &adapter_dir, &output_path, Some(&progress)).unwrap();
+    surgery::merge_adapter(
+        &base_path,
+        &adapter_dir,
+        &output_path,
+        false,
+        Some(&progress),
+    )
+    .unwrap();
 
     // Progress fires once per tensor (2) + once for the final call = 3
     let count = call_count.load(std::sync::atomic::Ordering::SeqCst);
@@ -998,7 +1014,7 @@ fn merge_sharded_model() {
         }"#,
     );
 
-    let stats = surgery::merge_adapter(&base_dir, &adapter_dir, &output_dir, None).unwrap();
+    let stats = surgery::merge_adapter(&base_dir, &adapter_dir, &output_dir, false, None).unwrap();
 
     assert_eq!(stats.tensors_merged, 1);
     assert_eq!(stats.tensors_copied, 1);
@@ -1073,7 +1089,7 @@ fn merge_errors_on_missing_adapter_config() {
         ],
     );
 
-    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None);
+    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None);
     assert!(result.is_err());
 }
 
@@ -1127,7 +1143,7 @@ fn merge_errors_when_no_targets_match() {
         }"#,
     );
 
-    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, None);
+    let result = surgery::merge_adapter(&base_path, &adapter_dir, &output_path, false, None);
     assert!(result.is_err());
     let err_msg = result.unwrap_err().to_string();
     assert!(

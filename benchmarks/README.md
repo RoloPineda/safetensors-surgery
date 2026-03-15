@@ -2,7 +2,7 @@
 
 Compare safetensors-surgery against PEFT `merge_and_unload`, PEFT low-memory mode, and mergekit.
 
-Measures three things per tool: peak memory (RSS), wall-clock time, and merge accuracy against an f64 gold standard.
+Measures three things per tool: peak memory (RSS), wall-clock time, and merge accuracy against a Python f64 reference.
 
 ## Quick start
 
@@ -20,22 +20,23 @@ That's it. uv reads dependency metadata from the scripts and handles Python vers
 
 ## Full benchmark
 
-Download all three models (~18GB total) and run with 3 iterations per tool:
+Download all four models and run with 3 iterations per tool:
 
 ```bash
 uv run benchmarks/download_data.py --models all
-uv run benchmarks/compare.py --models opt-350m tinyllama-1.1b mistral-7b --runs 3
+uv run benchmarks/compare.py --models all --runs 3
 ```
 
 ## Picking which models to benchmark
 
-Not everyone has 18GB of free disk. Pick what fits:
+Not everyone has 140GB of free disk. Pick what fits:
 
 | Model | Download | Base dtype | Notes |
 |---|---|---|---|
 | `opt-350m` | ~700MB | fp16 | Fast, good for sanity checks |
 | `tinyllama-1.1b` | ~2.5GB | bf16 | Tests bf16 accuracy path |
 | `mistral-7b` | ~15GB | bf16 | Single-file, 7B scale |
+| `llama3-70b` | ~124GB | bf16 | Sharded, 70B scale, requires significant disk |
 
 ```bash
 # Download only what you need
@@ -50,7 +51,7 @@ uv run benchmarks/download_data.py --list
 ```
 benchmarks/compare.py options:
   --models MODEL [MODEL ...]   Which models to benchmark
-  --tools TOOL [TOOL ...]      Which tools (surgery, peft, peft_low_mem, mergekit)
+  --tools TOOL [TOOL ...]      Which tools (surgery, surgery_low_mem, peft, peft_low_mem, mergekit)
   --runs N                     Iterations per tool (default: 3, reports median)
   --output PATH                Output chart path (default: benchmarks/results.png)
   --drop-caches                Drop OS page cache before each run (requires passwordless sudo)
@@ -59,6 +60,10 @@ benchmarks/compare.py options:
 Run only specific tools:
 
 ```bash
+# Compare default and low-memory surgery modes
+uv run benchmarks/compare.py --models mistral-7b --tools surgery surgery_low_mem --runs 3
+
+# Compare surgery against PEFT only
 uv run benchmarks/compare.py --models opt-350m --tools surgery peft --runs 1
 ```
 
@@ -79,15 +84,23 @@ python3 benchmarks/compare.py --models opt-350m --runs 1
 
 **Time (s):** Wall-clock time including both merge and save-to-disk. Median of N runs. Includes process startup for all tools (Rust binary startup for surgery, Python interpreter startup for PEFT/mergekit).
 
-**LoRA Max Err:** Maximum intermediate f64 error of any single element in any LoRA target tensor, compared to the f64 gold standard. This measures implementation differences (GEMM accumulation order, precision paths) before downcast.
+**Max ULP:** Maximum ULP (unit in the last place) distance of any element in any LoRA target tensor, compared to a Python f64 reference merge computed on the fly. Lower is better. A max ULP of 0 means bit-identical to the reference after downcast; 1 means the adjacent representable value.
 
-**Accuracy Status:** Whether the intermediate error is bounded by a safe margin of the output dtype's machine epsilon. "Equivalent" means the difference vanishes when downcast to the output dtype, producing identical bytes. All tools should show "Equivalent."
+**Mean ULP:** Average ULP distance across all elements of all LoRA target tensors. Reported to 6 decimal places to distinguish near-perfect tools.
 
-**Passthrough:** Percentage of non-LoRA tensors that are bit-identical to the original base model.
+**Within 1 ULP (%):** Percentage of all LoRA-merged elements that are within 1 ULP of the f64 reference. 100% means every element is either exact or off by the smallest representable step.
+
+**Passthrough:** Percentage of non-LoRA tensors that are bit-identical to the original base model. Should always be 100% for all tools.
+
+## Accuracy methodology
+
+For each LoRA target tensor, the harness computes a Python f64 reference: `base_f64 + scaling * (B_f64 @ A_f64)`, where all operands are upcast to float64 before computation. This reference is then downcast to the output dtype (bf16/f16/f32) for comparison. ULP distance is computed using the IEEE 754 sign-magnitude integer trick, which maps floating-point values to integers such that adjacent representable floats differ by 1.
+
+The reference is computed per-tensor in 512-row chunks to avoid materializing the full model in memory simultaneously.
 
 ## Sharing results
 
-If you run benchmarks, we'd appreciate if you share your results. Include:
+If you run benchmarks, I'd appreciate if you share your results. Include:
 
 - CPU model (e.g., `lscpu | grep "Model name"`)
 - RAM amount

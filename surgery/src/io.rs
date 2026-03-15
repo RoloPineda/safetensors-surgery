@@ -11,7 +11,9 @@ use safetensors::Dtype;
 use serde::Deserialize;
 
 use crate::config::{AdapterConfig, BiasMode};
-use crate::merge::{bytes_to_f32, f64_to_bytes, merge_bias, merge_lora};
+use crate::merge::{
+    bytes_to_f32, bytes_to_f64, f32_to_bytes, merge_bias, streaming_lora_merge_write,
+};
 use crate::names::build_name_mapping;
 use crate::{MergeStats, Result, SurgeryError};
 
@@ -41,6 +43,9 @@ impl MappedSafetensors {
                 format!("{}: {}", path.display(), e),
             ))
         })?;
+        // SAFETY: Mmap::map requires unsafe because the OS could modify the file
+        // while mapped. We only read from immutable mmaps of model files that are
+        // not expected to change during the merge operation.
         let mmap = unsafe { Mmap::map(&file) }.map_err(|e| {
             SurgeryError::Io(std::io::Error::new(
                 e.kind(),
@@ -51,6 +56,7 @@ impl MappedSafetensors {
         let (header_len, metadata) = SafeTensors::read_metadata(&mmap).map_err(|e| {
             SurgeryError::Safetensors(format!("failed to parse safetensors header: {e}"))
         })?;
+        // Safetensors binary format: 8-byte LE u64 header length, then JSON header, then data.
         let data_offset = 8 + header_len;
 
         let mut tensors: Vec<(String, TensorInfo)> = Vec::new();
@@ -67,6 +73,7 @@ impl MappedSafetensors {
             ));
         }
 
+        // Sort by file offset for sequential I/O and deterministic output order.
         tensors.sort_by_key(|(_, info)| info.data_start);
 
         let index: HashMap<String, usize> = tensors
@@ -99,10 +106,20 @@ impl MappedSafetensors {
             }),
         }
     }
+
+    fn advise_sequential(&self) {
+        let _ = self.mmap.advise(memmap2::Advice::Sequential);
+    }
+
+    fn advise_dontneed(&self) {
+        let _ = self.mmap.advise(memmap2::Advice::Normal);
+    }
 }
 
 #[derive(Debug, Deserialize)]
 pub(crate) struct ShardIndex {
+    #[serde(default)]
+    metadata: serde_json::Value,
     weight_map: BTreeMap<String, String>,
 }
 
@@ -141,6 +158,15 @@ pub(crate) enum BaseModelSource {
 /// - If `path` is a directory containing `model.safetensors.index.json`, uses sharded mode.
 pub(crate) fn resolve_base_model(path: &Path) -> Result<BaseModelSource> {
     if path.is_file() {
+        if path.extension().and_then(|e| e.to_str()) != Some("safetensors") {
+            return Err(SurgeryError::Io(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                format!(
+                    "file '{}' does not have a .safetensors extension",
+                    path.display()
+                ),
+            )));
+        }
         return Ok(BaseModelSource::SingleFile(path.to_path_buf()));
     }
 
@@ -221,7 +247,7 @@ pub(crate) fn compute_dry_run_info(
     let mut estimated_bytes: u64 = 0;
 
     for (name, info) in base_names.iter().zip(tensor_infos.iter()) {
-        let elem_size = dtype_byte_size(info.dtype).unwrap_or(0);
+        let elem_size = dtype_byte_size(info.dtype, name).unwrap_or(0);
         let num_elements: usize = info.shape.iter().product();
         estimated_bytes += (num_elements * elem_size) as u64;
 
@@ -235,8 +261,10 @@ pub(crate) fn compute_dry_run_info(
     }
 
     let base_tensor_count = base_names.len();
-    let passthrough_count =
-        base_tensor_count - lora_target_count - replacement_count - bias_merge_count;
+    let passthrough_count = base_tensor_count
+        .saturating_sub(lora_target_count)
+        .saturating_sub(replacement_count)
+        .saturating_sub(bias_merge_count);
 
     Ok(crate::DryRunInfo {
         base_tensor_count,
@@ -266,12 +294,12 @@ fn build_output_header(
     }
 
     for (name, info) in tensors {
-        let elem_size = dtype_byte_size(info.dtype)?;
+        let elem_size = dtype_byte_size(info.dtype, name)?;
         let num_elements: usize = info.shape.iter().product();
         let byte_size = num_elements * elem_size;
 
         let tensor_entry = serde_json::json!({
-            "dtype": dtype_to_string(info.dtype),
+            "dtype": dtype_to_string(info.dtype, name)?,
             "shape": info.shape,
             "data_offsets": [current_offset, current_offset + byte_size],
         });
@@ -283,37 +311,44 @@ fn build_output_header(
     Ok((header_json.into_bytes(), current_offset))
 }
 
-fn dtype_byte_size(dtype: Dtype) -> Result<usize> {
+fn dtype_byte_size(dtype: Dtype, name: &str) -> Result<usize> {
     match dtype {
         Dtype::F16 | Dtype::BF16 => Ok(2),
         Dtype::F32 => Ok(4),
         _ => Err(SurgeryError::UnsupportedDtype {
-            name: "unknown".to_string(),
+            name: name.to_string(),
             dtype: format!("{dtype:?}"),
         }),
     }
 }
 
-fn dtype_to_string(dtype: Dtype) -> &'static str {
+fn dtype_to_string(dtype: Dtype, name: &str) -> Result<&'static str> {
     match dtype {
-        Dtype::F16 => "F16",
-        Dtype::BF16 => "BF16",
-        Dtype::F32 => "F32",
-        Dtype::F64 => "F64",
-        Dtype::I32 => "I32",
-        Dtype::I64 => "I64",
-        Dtype::U8 => "U8",
-        Dtype::I8 => "I8",
-        Dtype::BOOL => "BOOL",
-        Dtype::U16 => "U16",
-        Dtype::U32 => "U32",
-        Dtype::U64 => "U64",
-        Dtype::I16 => "I16",
-        _ => "F32",
+        Dtype::F16 => Ok("F16"),
+        Dtype::BF16 => Ok("BF16"),
+        Dtype::F32 => Ok("F32"),
+        Dtype::F64 => Ok("F64"),
+        Dtype::I32 => Ok("I32"),
+        Dtype::I64 => Ok("I64"),
+        Dtype::U8 => Ok("U8"),
+        Dtype::I8 => Ok("I8"),
+        Dtype::BOOL => Ok("BOOL"),
+        Dtype::U16 => Ok("U16"),
+        Dtype::U32 => Ok("U32"),
+        Dtype::U64 => Ok("U64"),
+        Dtype::I16 => Ok("I16"),
+        _ => Err(SurgeryError::UnsupportedDtype {
+            name: name.to_string(),
+            dtype: format!("{dtype:?}"),
+        }),
     }
 }
 
 /// Processes a single tensor: merge, replace, bias-merge, or pass-through.
+// 8 parameters represent distinct concerns: tensor identity, base data, adapter source,
+// merge config, name mapping, memory mode, and output writer. Bundling into a struct
+// would add indirection without reducing conceptual complexity.
+#[allow(clippy::too_many_arguments)]
 fn process_tensor(
     name: &str,
     info: &TensorInfo,
@@ -321,9 +356,36 @@ fn process_tensor(
     adapter: &MappedSafetensors,
     config: &AdapterConfig,
     name_mapping: &crate::names::NameMapping,
+    low_memory: bool,
     writer: &mut BufWriter<File>,
 ) -> Result<TensorAction> {
     if let Some(adapter_tensor_name) = name_mapping.replacement(name) {
+        let adapter_info = adapter.tensor_info(adapter_tensor_name)?;
+        if adapter_info.dtype != info.dtype {
+            return Err(SurgeryError::UnsupportedDtype {
+                name: format!("replacement tensor '{name}'"),
+                dtype: format!(
+                    "expected {:?} but adapter has {:?}",
+                    info.dtype, adapter_info.dtype
+                ),
+            });
+        }
+        if adapter_info.shape != info.shape {
+            return Err(SurgeryError::ShapeMismatch {
+                name: name.to_string(),
+                expected: info.shape.clone(),
+                got: adapter_info.shape.clone(),
+            });
+        }
+        let expected_len = info.data_end - info.data_start;
+        let adapter_len = adapter_info.data_end - adapter_info.data_start;
+        if adapter_len != expected_len {
+            return Err(SurgeryError::ShapeMismatch {
+                name: format!("replacement tensor '{name}' byte length"),
+                expected: vec![expected_len],
+                got: vec![adapter_len],
+            });
+        }
         let adapter_data = adapter.tensor_data(adapter_tensor_name)?;
         writer.write_all(adapter_data)?;
         return Ok(TensorAction::Replaced);
@@ -335,30 +397,30 @@ fn process_tensor(
         let lora_a_data = adapter.tensor_data(lora_a_name)?;
         let lora_b_data = adapter.tensor_data(lora_b_name)?;
 
-        let base_f32 = bytes_to_f32(base_data, info.dtype, &info.shape, name)?;
-        let a_f32 = bytes_to_f32(
+        let a_f64 = bytes_to_f64(
             lora_a_data,
             lora_a_info.dtype,
             &lora_a_info.shape,
             lora_a_name,
         )?;
-        let b_f32 = bytes_to_f32(
+        let b_f64 = bytes_to_f64(
             lora_b_data,
             lora_b_info.dtype,
             &lora_b_info.shape,
             lora_b_name,
         )?;
 
-        let merged = merge_lora(
-            &base_f32,
-            &a_f32,
-            &b_f32,
-            config.scaling(),
+        streaming_lora_merge_write(
+            base_data,
+            &a_f64,
+            &b_f64,
+            config.scaling() as f64,
             config.fan_in_fan_out(),
-        );
-
-        let merged_bytes = f64_to_bytes(&merged, info.dtype)?;
-        writer.write_all(&merged_bytes)?;
+            &info.shape,
+            info.dtype,
+            low_memory,
+            writer,
+        )?;
         return Ok(TensorAction::Merged);
     }
 
@@ -387,8 +449,8 @@ fn process_tensor(
                 adapter_bias_name,
             )?;
 
-            let merged = merge_bias(&base_f32, &adapter_f32);
-            let merged_bytes = f64_to_bytes(&merged, info.dtype)?;
+            let merged = merge_bias(&base_f32, &adapter_f32)?;
+            let merged_bytes = f32_to_bytes(&merged, info.dtype)?;
             writer.write_all(&merged_bytes)?;
             return Ok(TensorAction::BiasMerged);
         }
@@ -411,10 +473,12 @@ pub fn merge_and_write(
     adapter_weights_path: &Path,
     config: &AdapterConfig,
     output_path: &Path,
+    low_memory: bool,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MergeStats> {
     let base = MappedSafetensors::open(base_model_path)?;
     let adapter = MappedSafetensors::open(adapter_weights_path)?;
+    base.advise_sequential();
 
     let base_names: Vec<&str> = base.tensors.iter().map(|(n, _)| n.as_str()).collect();
     let adapter_names: Vec<&str> = adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
@@ -437,8 +501,9 @@ pub fn merge_and_write(
         build_output_header(&output_tensor_list, base.metadata.as_ref())?;
 
     let output_file = File::create(output_path)?;
-    let mut writer = BufWriter::new(output_file);
+    let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
 
+    // Safetensors format: 8-byte LE header length, then JSON header, then tensor data.
     let header_len = header_bytes.len() as u64;
     writer.write_all(&header_len.to_le_bytes())?;
     writer.write_all(&header_bytes)?;
@@ -463,6 +528,7 @@ pub fn merge_and_write(
             &adapter,
             config,
             &name_mapping,
+            low_memory,
             &mut writer,
         )?;
         apply_action(&mut stats, action);
@@ -492,16 +558,15 @@ pub(crate) fn merge_sharded(
     adapter_weights_path: &Path,
     config: &AdapterConfig,
     output_dir: &Path,
+    low_memory: bool,
     progress: Option<&dyn Fn(usize, usize)>,
 ) -> Result<MergeStats> {
     let adapter = MappedSafetensors::open(adapter_weights_path)?;
 
     let shard_filenames = index.shard_filenames();
 
-    let all_base_names: Vec<&str> = index.weight_map.keys().map(|s| s.as_str()).collect();
-    let total_tensors = all_base_names.len();
-
-    let base_name_refs: Vec<&str> = all_base_names;
+    let base_name_refs: Vec<&str> = index.weight_map.keys().map(|s| s.as_str()).collect();
+    let total_tensors = base_name_refs.len();
     let adapter_names: Vec<&str> = adapter.tensors.iter().map(|(n, _)| n.as_str()).collect();
 
     let name_mapping = build_name_mapping(
@@ -522,8 +587,21 @@ pub(crate) fn merge_sharded(
     let mut tensors_processed: usize = 0;
 
     for shard_filename in &shard_filenames {
+        // Validate shard filename to prevent path traversal via crafted index.json.
+        let shard_path_component = Path::new(shard_filename);
+        if shard_path_component.is_absolute()
+            || shard_path_component
+                .components()
+                .any(|c| matches!(c, std::path::Component::ParentDir))
+        {
+            return Err(SurgeryError::ShardingError(format!(
+                "shard filename '{shard_filename}' contains path traversal"
+            )));
+        }
+
         let shard_path = base_dir.join(shard_filename);
         let shard = MappedSafetensors::open(&shard_path)?;
+        shard.advise_sequential();
 
         let output_shard_path = output_dir.join(shard_filename);
 
@@ -535,7 +613,7 @@ pub(crate) fn merge_sharded(
         let (header_bytes, _) = build_output_header(&shard_tensor_list, shard.metadata.as_ref())?;
 
         let output_file = File::create(&output_shard_path)?;
-        let mut writer = BufWriter::new(output_file);
+        let mut writer = BufWriter::with_capacity(8 * 1024 * 1024, output_file);
 
         let header_len = header_bytes.len() as u64;
         writer.write_all(&header_len.to_le_bytes())?;
@@ -554,6 +632,7 @@ pub(crate) fn merge_sharded(
                 &adapter,
                 config,
                 &name_mapping,
+                low_memory,
                 &mut writer,
             )?;
             apply_action(&mut stats, action);
@@ -561,6 +640,7 @@ pub(crate) fn merge_sharded(
         }
 
         writer.flush()?;
+        shard.advise_dontneed();
     }
 
     if let Some(progress) = &progress {
@@ -574,7 +654,7 @@ pub(crate) fn merge_sharded(
 
 fn write_output_index(index: &ShardIndex, output_dir: &Path) -> Result<()> {
     let output_index = serde_json::json!({
-        "metadata": {},
+        "metadata": index.metadata,
         "weight_map": index.weight_map,
     });
     let json = serde_json::to_string_pretty(&output_index)?;
@@ -671,8 +751,15 @@ mod tests {
 
         let output_path = dir.path().join("merged.safetensors");
 
-        let stats =
-            merge_and_write(&base_path, &adapter_path, &config, &output_path, None).unwrap();
+        let stats = merge_and_write(
+            &base_path,
+            &adapter_path,
+            &config,
+            &output_path,
+            false,
+            None,
+        )
+        .unwrap();
 
         assert_eq!(stats.tensors_merged, 1);
         assert_eq!(stats.tensors_copied, 1);
@@ -785,6 +872,7 @@ mod tests {
             &adapter_dir.join("adapter_model.safetensors"),
             &config,
             &output_dir,
+            false,
             None,
         )
         .unwrap();
@@ -886,10 +974,10 @@ mod tests {
 
     #[test]
     fn dtype_byte_size_all_supported() {
-        assert_eq!(dtype_byte_size(Dtype::F16).unwrap(), 2);
-        assert_eq!(dtype_byte_size(Dtype::BF16).unwrap(), 2);
-        assert_eq!(dtype_byte_size(Dtype::F32).unwrap(), 4);
-        assert!(dtype_byte_size(Dtype::I32).is_err());
+        assert_eq!(dtype_byte_size(Dtype::F16, "test").unwrap(), 2);
+        assert_eq!(dtype_byte_size(Dtype::BF16, "test").unwrap(), 2);
+        assert_eq!(dtype_byte_size(Dtype::F32, "test").unwrap(), 4);
+        assert!(dtype_byte_size(Dtype::I32, "test").is_err());
     }
 
     #[test]
@@ -947,7 +1035,15 @@ mod tests {
         let config = crate::config::AdapterConfig::from_json(config_json).unwrap();
 
         let output_path = dir.path().join("merged.safetensors");
-        merge_and_write(&base_path, &adapter_path, &config, &output_path, None).unwrap();
+        merge_and_write(
+            &base_path,
+            &adapter_path,
+            &config,
+            &output_path,
+            false,
+            None,
+        )
+        .unwrap();
 
         // Check metadata is preserved
         let output = MappedSafetensors::open(&output_path).unwrap();
